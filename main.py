@@ -1,6 +1,7 @@
 import pygame
 import random
 import math
+from typing import List, Optional
 
 # --- 常量 ---
 SCREEN_WIDTH = 800
@@ -159,7 +160,7 @@ class Game:
             # Decide if font is critical; for now, let it proceed or raise
             # raise
 
-        self.players_objects = [[], []] # 存储两方玩家的object
+        self.players_objects: List[List[GameObject]] = [[], []] # 存储两方玩家的object
         self.scores = [0, 0] # 存储两方玩家的胜利点
 
         self.setup_objects()
@@ -168,7 +169,7 @@ class Game:
         self.first_player_of_round = self.current_player_turn
         print(f"第一回合先手: Player {self.current_player_turn + 1}") # This is an existing print
 
-        self.selected_object = None
+        self.selected_object: Optional[GameObject] = None
         self.is_dragging = False
         self.drag_start_pos = None
         self.game_over = False
@@ -443,6 +444,40 @@ class Game:
                         # 使用冲量法处理碰撞 (考虑质量和弹性)
                         e = (obj1.restitution)
 
+                        # 假设 obj1.mass 和 obj2.mass 是表示质量的属性。
+                        # 质量 <= 0 可以用来表示不可移动的物体（无限质量）。
+                        m1 = obj1.mass
+                        m2 = obj2.mass
+
+                        # 如果两个物体都不可移动或质量无效，则跳过冲量计算。
+                        # 这也防止了在两个质量都 <= 0 时发生除以零的错误。
+                        if m1 <= 0 and m2 <= 0:
+                            continue
+
+                        inv_m1 = 1.0 / m1 if m1 > 0 else 0.0  # obj1 的逆质量
+                        inv_m2 = 1.0 / m2 if m2 > 0 else 0.0  # obj2 的逆质量
+
+                        # 用于冲量计算的总逆质量。
+                        total_inv_mass = inv_m1 + inv_m2
+
+                        # 如果 total_inv_mass 为 0，意味着两个物体都不可移动。
+                        # （如果上面的 (m1 <= 0 and m2 <= 0) 检查是全面的，这个检查有些多余，
+                        # 但作为一个安全措施是好的，特别是如果 m1 或 m2 可能因其他原因为负）。
+                        if total_inv_mass == 0:
+                            continue
+
+                        # 计算冲量标量
+                        # 冲量 j 的公式是：j = -(1 + e) * v_rel_normal / (1/m1 + 1/m2)
+                        impulse_j = -(1 + e) * vel_along_normal / total_inv_mass
+
+                        # 应用冲量来更新速度
+                        # 速度变化 = 冲量 / 质量 * 法向量
+                        # (冲量 / 质量) 等于 (冲量 * 逆质量)
+                        obj1.vx += impulse_j * inv_m1 * nx
+                        obj1.vy += impulse_j * inv_m1 * ny
+                        obj2.vx -= impulse_j * inv_m2 * nx # obj2 受到的冲量方向相反
+                        obj2.vy -= impulse_j * inv_m2 * ny
+
 # --- 主程序循环 ---
 if __name__ == '__main__':
     game = Game()
@@ -459,3 +494,4 @@ if __name__ == '__main__':
         game.frame_count += 1 # 更新游戏帧计数
 
     pygame.quit()
+
