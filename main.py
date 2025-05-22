@@ -4,7 +4,7 @@ import math
 from typing import List, Optional
 
 # --- 常量 ---
-SCREEN_WIDTH = 800
+SCREEN_WIDTH = 1000
 SCREEN_HEIGHT = 600
 FPS = 60
 
@@ -17,7 +17,7 @@ GREEN = (0, 255, 0)
 
 # 游戏参数
 OBJECT_RADIUS = 20
-INITIAL_HP = 50
+INITIAL_HP = 20
 INITIAL_ATTACK = 10
 MAX_VICTORY_POINTS = 5 # 胜利点数
 
@@ -133,8 +133,9 @@ class GameObject:
         self.is_moving = False
         self.angle = 0.0
         self.angular_velocity = 0.0
+        self.has_moved_this_turn = False # Ensure it's ready to move again
+        self.last_damaged_frame = -1000 # Reset damage cooldown
         # self.mass and self.moment_of_inertia remain as initialized
-        # self.has_moved_this_turn will be reset at the start of a player's turn or round
 
 
 # --- 游戏主类 ---
@@ -240,50 +241,13 @@ class Game:
         print(f"下一回合开始，Player {self.current_player_turn + 1} 先手")
 
     def check_object_destruction_and_scoring(self):
+        # This method is largely superseded by per-KO scoring.
+        # It can be removed or repurposed if a different game mode (e.g., team wipe) is desired later.
+        # For now, it will not be called in the main game loop for scoring.
         if self.game_over: # Don't process if game already ended
-            return
+            return False # Return False, indicating no board-wide reset occurred based on old rules
 
-        player0_alive_units = sum(1 for obj in self.players_objects[0] if obj.hp > 0)
-        player1_alive_units = sum(1 for obj in self.players_objects[1] if obj.hp > 0)
-
-        point_scored_by_player = -1 # -1: no score, 0: player 0 scores, 1: player 1 scores
-
-        if player0_alive_units == 0 and player1_alive_units > 0:
-            self.scores[1] += 1
-            point_scored_by_player = 1
-            print(f"Player 2 scores a point! Score: P1 {self.scores[0]} - P2 {self.scores[1]}")
-        elif player1_alive_units == 0 and player0_alive_units > 0:
-            self.scores[0] += 1
-            point_scored_by_player = 0
-            print(f"Player 1 scores a point! Score: P1 {self.scores[0]} - P2 {self.scores[1]}")
-        elif player0_alive_units == 0 and player1_alive_units == 0: # Mutual destruction
-            print("Mutual destruction! No point scored. Resetting board.")
-            point_scored_by_player = -2 # Special value for mutual destruction reset
-
-        if point_scored_by_player != -1: # If a point was scored or mutual destruction
-            if self.scores[0] >= MAX_VICTORY_POINTS:
-                self.game_over = True
-                self.winner = 0
-                print("Player 1 wins the game!")
-                return # Game over, no further reset needed for turns
-            elif self.scores[1] >= MAX_VICTORY_POINTS:
-                self.game_over = True
-                self.winner = 1
-                print("Player 2 wins the game!")
-                return # Game over, no further reset needed for turns
-
-            # Respawn all objects for both players and reset their moved status
-            for player_idx in range(2):
-                for obj in self.players_objects[player_idx]:
-                    obj.respawn()
-                    obj.has_moved_this_turn = False
-            
-            # After a score and reset, the turn goes to the designated first player of the current round.
-            self.current_player_turn = self.first_player_of_round
-            print(f"Board reset. Player {self.current_player_turn + 1} (round starter) to move.")
-            return True # Indicates a score and reset occurred
-
-        return False # Indicates no score/reset occurred
+        return False # Indicates no score/reset occurred under old rules
 
     def draw_drag_line(self):
         if self.is_dragging and self.selected_object and self.drag_start_pos:
@@ -533,6 +497,21 @@ class Game:
                                 # only the opponent's object takes damage.
                                 if current_player_obj and opponent_obj:
                                     opponent_damaged = opponent_obj.take_damage(current_player_obj.attack, self.frame_count)
+                                    
+                                    if opponent_damaged and opponent_obj.hp <= 0:
+                                        # Opponent object is KO'd
+                                        scoring_player_id = current_player_obj.player_id
+                                        self.scores[scoring_player_id] += 1
+                                        print(f"Player {scoring_player_id + 1} scores a point! Score: P1 {self.scores[0]} - P2 {self.scores[1]}")
+                                        
+                                        # DO NOT RESPAWN YET. Object hp is 0.
+                                        print(f"Object of Player {opponent_obj.player_id + 1} was KO'd.")
+
+                                        if self.scores[scoring_player_id] >= MAX_VICTORY_POINTS:
+                                            self.game_over = True
+                                            self.winner = scoring_player_id
+                                            print(f"Player {self.winner + 1} wins the game!")
+                                            return # Game over, stop further updates this frame
                                     # Potentially add sound/visual effects here if opponent_damaged is True
 
                     # Immediately check and correct boundary collision after position and velocity changes
@@ -543,25 +522,29 @@ class Game:
         if self.action_processing_pending and self.all_objects_stopped(): # Check if all objects have stopped
             self.action_processing_pending = False # Reset pending flag
 
-            score_occurred_and_reset = self.check_object_destruction_and_scoring()
-
-            if self.game_over:
+            if self.game_over: # Check again in case a KO during this frame ended the game
                 return
 
-            if not score_occurred_and_reset:
-                player_who_just_moved = self.current_player_turn
-                potential_next_player = 1 - player_who_just_moved
+            # Respawn any KO'd objects before turn progression
+            for player_idx in range(2):
+                for obj in self.players_objects[player_idx]:
+                    if obj.hp <= 0:
+                        print(f"Respawning KO'd object for Player {obj.player_id + 1} (Obj ID: {obj.object_id})")
+                        obj.respawn()
 
-                can_potential_next_player_move = self.can_player_move(potential_next_player)
-                can_player_who_just_moved_still_move = self.can_player_move(player_who_just_moved)
+            player_who_just_moved = self.current_player_turn
+            potential_next_player = 1 - player_who_just_moved
 
-                if can_potential_next_player_move:
-                    self.current_player_turn = potential_next_player
-                    print(f"Player {player_who_just_moved + 1} finished move. Now Player {self.current_player_turn + 1}'s turn.")
-                elif can_player_who_just_moved_still_move:
-                    print(f"Player {potential_next_player + 1} has no more moves. Player {self.current_player_turn + 1} continues.")
-                else:
-                    self.next_round()
+            can_potential_next_player_move = self.can_player_move(potential_next_player)
+            can_player_who_just_moved_still_move = self.can_player_move(player_who_just_moved)
+
+            if can_potential_next_player_move:
+                self.current_player_turn = potential_next_player
+                print(f"Player {player_who_just_moved + 1} finished move. Now Player {self.current_player_turn + 1}'s turn.")
+            elif can_player_who_just_moved_still_move:
+                print(f"Player {potential_next_player + 1} has no more moves. Player {self.current_player_turn + 1} continues.")
+            else:
+                self.next_round()
 
 # --- 主程序循环 ---
 if __name__ == '__main__':
