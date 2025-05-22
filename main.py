@@ -518,10 +518,22 @@ class Game:
 
                             # --- Damage Application ---
                             if obj1.player_id != obj2.player_id: # Only apply damage if different teams
-                                # Damage is dealt if impulse was applied (i.e., they collided meaningfully)
-                                obj1_damaged = obj1.take_damage(obj2.attack, self.frame_count)
-                                obj2_damaged = obj2.take_damage(obj1.attack, self.frame_count)
-                                # Potentially add sound/visual effects here if objX_damaged is True
+                                # Determine which object is the current player's (attacker) and which is opponent's (defender)
+                                current_player_obj = None
+                                opponent_obj = None
+
+                                if obj1.player_id == self.current_player_turn:
+                                    current_player_obj = obj1
+                                    opponent_obj = obj2
+                                elif obj2.player_id == self.current_player_turn:
+                                    current_player_obj = obj2
+                                    opponent_obj = obj1
+                                
+                                # If one object is the current player's and the other is the opponent's,
+                                # only the opponent's object takes damage.
+                                if current_player_obj and opponent_obj:
+                                    opponent_damaged = opponent_obj.take_damage(current_player_obj.attack, self.frame_count)
+                                    # Potentially add sound/visual effects here if opponent_damaged is True
 
                     # Immediately check and correct boundary collision after position and velocity changes
                     obj1.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
