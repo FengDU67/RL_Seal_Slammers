@@ -17,7 +17,7 @@ GREEN = (0, 255, 0)
 
 # 游戏参数
 OBJECT_RADIUS = 20
-INITIAL_HP = 100
+INITIAL_HP = 50
 INITIAL_ATTACK = 10
 MAX_VICTORY_POINTS = 5 # 胜利点数
 
@@ -430,13 +430,15 @@ class Game:
         if self.game_over:
             return
 
-        any_object_moving_after_launch = False
+        any_object_moving_after_launch = False # Renamed for clarity, was implicitly any_object_moving
         for player_objs in self.players_objects:
             for obj in player_objs:
                 if obj.is_moving:
                     obj.move()
                     obj.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
-                    any_object_moving_after_launch = True
+                    # If obj is still moving after move() and boundary check, then something is moving.
+                    if obj.is_moving: # Check again as move() might set it to False
+                        any_object_moving_after_launch = True
 
         active_objects = [obj for player_list in self.players_objects for obj in player_list if obj.hp > 0]
 
@@ -449,25 +451,29 @@ class Game:
                 dist_y = obj1.y - obj2.y
                 distance = math.hypot(dist_x, dist_y)
 
-                if distance == 0:
+                if distance == 0: # Avoid division by zero if objects are exactly at the same spot
+                    # Slightly perturb one object to resolve exact overlap, then recalculate
                     obj1.x += random.uniform(-0.1, 0.1)
                     obj1.y += random.uniform(-0.1, 0.1)
-                    dist_x = obj1.x - obj2.x
-                    dist_y = obj1.y - obj2.y
-                    distance = math.hypot(dist_x, dist_y)
-                    if distance == 0: continue
+                    dist_x = obj1.x - obj2.x # Recalculate
+                    dist_y = obj1.y - obj2.y # Recalculate
+                    distance = math.hypot(dist_x, dist_y) # Recalculate
+                    if distance == 0: continue # If still zero (highly unlikely), skip this pair for this frame
 
                 min_dist = obj1.radius + obj2.radius
                 if distance < min_dist:
+                    # --- Overlap Resolution ---
                     overlap = min_dist - distance
-                    nx = dist_x / distance if distance != 0 else 1.0
-                    ny = dist_y / distance if distance != 0 else 0.0
+                    nx = dist_x / distance if distance != 0 else 1.0 # Normalized collision normal x
+                    ny = dist_y / distance if distance != 0 else 0.0 # Normalized collision normal y
 
+                    # Correct positions to remove overlap
                     inv_m1 = 1.0 / obj1.mass if obj1.mass > 0 else 0.0
                     inv_m2 = 1.0 / obj2.mass if obj2.mass > 0 else 0.0
                     total_inv_mass_correction = inv_m1 + inv_m2
 
                     if total_inv_mass_correction > 0:
+                        # Distribute correction based on inverse mass
                         correction_factor_obj1 = inv_m1 / total_inv_mass_correction
                         correction_factor_obj2 = inv_m2 / total_inv_mass_correction
                         
@@ -475,36 +481,55 @@ class Game:
                         obj1.y += ny * overlap * correction_factor_obj1
                         obj2.x -= nx * overlap * correction_factor_obj2
                         obj2.y -= ny * overlap * correction_factor_obj2
-                    elif obj1.mass > 0:
+                    elif obj1.mass > 0: # Only obj1 has mass, move it fully
                         obj1.x += nx * overlap
                         obj1.y += ny * overlap
-                    elif obj2.mass > 0:
+                    elif obj2.mass > 0: # Only obj2 has mass, move it fully
                         obj2.x -= nx * overlap
                         obj2.y -= ny * overlap
+                    # If neither has mass (both masses are 0), they won't be moved by this logic.
 
-                    rvx = obj1.vx - obj2.vx
-                    rvy = obj1.vy - obj2.vy
-                    vel_along_normal = rvx * nx + rvy * ny
+                    # --- Impulse Calculation (Collision Response) ---
+                    rvx = obj1.vx - obj2.vx # Relative velocity x
+                    rvy = obj1.vy - obj2.vy # Relative velocity y
+                    vel_along_normal = rvx * nx + rvy * ny # Velocity component along the normal
 
-                    if vel_along_normal < 0:
-                        e = min(obj1.restitution, obj2.restitution)
+                    if vel_along_normal < 0: # Objects are moving towards each other
+                        e = min(obj1.restitution, obj2.restitution) # Coefficient of restitution
 
-                        total_inv_mass_impulse = inv_m1 + inv_m2
+                        total_inv_mass_impulse = inv_m1 + inv_m2 # Effective inverse mass for impulse
 
                         if total_inv_mass_impulse > 0:
                             impulse_j = -(1 + e) * vel_along_normal / total_inv_mass_impulse
 
+                            # Apply impulse
                             obj1.vx += impulse_j * inv_m1 * nx
                             obj1.vy += impulse_j * inv_m1 * ny
                             obj2.vx -= impulse_j * inv_m2 * nx
                             obj2.vy -= impulse_j * inv_m2 * ny
 
-                            if obj1.player_id != obj2.player_id:
-                                obj1.take_damage(obj2.attack, self.frame_count)
-                                obj2.take_damage(obj1.attack, self.frame_count)
+                            # If objects gained velocity, mark them as moving
+                            if abs(obj1.vx) > 0.01 or abs(obj1.vy) > 0.01: # Use a small threshold
+                                obj1.is_moving = True
+                            if abs(obj2.vx) > 0.01 or abs(obj2.vy) > 0.01:
+                                obj2.is_moving = True
+                            
+                            any_object_moving_after_launch = True # Collision might start new movements
 
-        if self.action_processing_pending and self.all_objects_stopped():
-            self.action_processing_pending = False
+                            # --- Damage Application ---
+                            if obj1.player_id != obj2.player_id: # Only apply damage if different teams
+                                # Damage is dealt if impulse was applied (i.e., they collided meaningfully)
+                                obj1_damaged = obj1.take_damage(obj2.attack, self.frame_count)
+                                obj2_damaged = obj2.take_damage(obj1.attack, self.frame_count)
+                                # Potentially add sound/visual effects here if objX_damaged is True
+
+                    # Immediately check and correct boundary collision after position and velocity changes
+                    obj1.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
+                    obj2.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+
+        if self.action_processing_pending and self.all_objects_stopped(): # Check if all objects have stopped
+            self.action_processing_pending = False # Reset pending flag
 
             score_occurred_and_reset = self.check_object_destruction_and_scoring()
 
