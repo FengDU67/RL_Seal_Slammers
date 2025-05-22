@@ -166,8 +166,8 @@ class Game:
         self.setup_objects()
 
         self.current_player_turn = random.choice([0, 1]) # 0: Player 1, 1: Player 2
-        self.first_player_of_round = self.current_player_turn
-        print(f"第一回合先手: Player {self.current_player_turn + 1}") # This is an existing print
+        self.first_player_of_round = self.current_player_turn # Player who starts the round or after a score reset
+        print(f"第一回合先手: Player {self.current_player_turn + 1}")
 
         self.selected_object: Optional[GameObject] = None
         self.is_dragging = False
@@ -220,9 +220,15 @@ class Game:
                 return False
         return True
 
+    def can_player_move(self, player_id: int) -> bool:
+        """Checks if the specified player has any units that can still move."""
+        for obj in self.players_objects[player_id]:
+            if obj.hp > 0 and not obj.has_moved_this_turn:
+                return True
+        return False
+
     def switch_player(self):
         self.current_player_turn = 1 - self.current_player_turn
-        print(f"轮到 Player {self.current_player_turn + 1} 行动")
 
     def next_round(self):
         print("回合结束，交换先手")
@@ -233,43 +239,80 @@ class Game:
                 obj.has_moved_this_turn = False # 重置所有单位的行动状态
         print(f"下一回合开始，Player {self.current_player_turn + 1} 先手")
 
+    def check_object_destruction_and_scoring(self):
+        if self.game_over: # Don't process if game already ended
+            return
+
+        player0_alive_units = sum(1 for obj in self.players_objects[0] if obj.hp > 0)
+        player1_alive_units = sum(1 for obj in self.players_objects[1] if obj.hp > 0)
+
+        point_scored_by_player = -1 # -1: no score, 0: player 0 scores, 1: player 1 scores
+
+        if player0_alive_units == 0 and player1_alive_units > 0:
+            self.scores[1] += 1
+            point_scored_by_player = 1
+            print(f"Player 2 scores a point! Score: P1 {self.scores[0]} - P2 {self.scores[1]}")
+        elif player1_alive_units == 0 and player0_alive_units > 0:
+            self.scores[0] += 1
+            point_scored_by_player = 0
+            print(f"Player 1 scores a point! Score: P1 {self.scores[0]} - P2 {self.scores[1]}")
+        elif player0_alive_units == 0 and player1_alive_units == 0: # Mutual destruction
+            print("Mutual destruction! No point scored. Resetting board.")
+            point_scored_by_player = -2 # Special value for mutual destruction reset
+
+        if point_scored_by_player != -1: # If a point was scored or mutual destruction
+            if self.scores[0] >= MAX_VICTORY_POINTS:
+                self.game_over = True
+                self.winner = 0
+                print("Player 1 wins the game!")
+                return # Game over, no further reset needed for turns
+            elif self.scores[1] >= MAX_VICTORY_POINTS:
+                self.game_over = True
+                self.winner = 1
+                print("Player 2 wins the game!")
+                return # Game over, no further reset needed for turns
+
+            # Respawn all objects for both players and reset their moved status
+            for player_idx in range(2):
+                for obj in self.players_objects[player_idx]:
+                    obj.respawn()
+                    obj.has_moved_this_turn = False
+            
+            # After a score and reset, the turn goes to the designated first player of the current round.
+            self.current_player_turn = self.first_player_of_round
+            print(f"Board reset. Player {self.current_player_turn + 1} (round starter) to move.")
+            return True # Indicates a score and reset occurred
+
+        return False # Indicates no score/reset occurred
 
     def draw_drag_line(self):
         if self.is_dragging and self.selected_object and self.drag_start_pos:
             mouse_x, mouse_y = pygame.mouse.get_pos()
-            # 从物体中心画线到鼠标当前位置的反方向预览发射方向和力度
             obj_center_x, obj_center_y = self.selected_object.x, self.selected_object.y
 
-            # 向量: 从物体中心到鼠标 (dx, dy)
             dx_mouse = mouse_x - obj_center_x
             dy_mouse = mouse_y - obj_center_y
 
-            # 反向向量，代表发射方向
             launch_vx = -dx_mouse
             launch_vy = -dy_mouse
 
-            # 指示线终点 (可以根据力度调整长度)
-            line_length_factor = 0.5 # 可调整，让线不要太长
+            line_length_factor = 0.5
             end_line_x = obj_center_x + launch_vx * line_length_factor
             end_line_y = obj_center_y + launch_vy * line_length_factor
 
             pygame.draw.line(self.screen, GREEN, (obj_center_x, obj_center_y), (end_line_x, end_line_y), 2)
-            pygame.draw.circle(self.screen, GREEN, (int(end_line_x), int(end_line_y)), 5) # 箭头
-
+            pygame.draw.circle(self.screen, GREEN, (int(end_line_x), int(end_line_y)), 5)
 
     def draw(self):
         self.screen.fill(WHITE)
 
-        # 绘制所有对象
         for player_objs in self.players_objects:
             for obj in player_objs:
-                if obj.hp > 0: # 只绘制存活的物体
+                if obj.hp > 0:
                     obj.draw(self.screen)
 
-        # 绘制拖拽指示线
         self.draw_drag_line()
 
-        # 显示分数和当前回合信息
         score_text_p1 = self.font.render(f"Player 1 (Blue): {self.scores[0]}", True, BLUE)
         score_text_p2 = self.font.render(f"Player 2 (Red): {self.scores[1]}", True, RED)
         self.screen.blit(score_text_p1, (10, 10))
@@ -280,29 +323,25 @@ class Game:
 
         action_prompt = ""
         if not self.game_over:
-            current_player_can_move = False
-            if self.all_objects_stopped(): # Ensure we check this only when objects are stopped
-                for obj_ in self.players_objects[self.current_player_turn]:
-                    if obj_.hp > 0 and not obj_.has_moved_this_turn:
-                        current_player_can_move = True
-                        break
-                if current_player_can_move:
+            current_player_can_move_now = False
+            if self.all_objects_stopped():
+                if self.can_player_move(self.current_player_turn):
+                    current_player_can_move_now = True
+                
+                if current_player_can_move_now:
                     action_prompt = f"{player_name}, select an object to launch."
                 else:
-                    action_prompt = f"{player_name} has no more units to move. Waiting..."
+                    action_prompt = f"{player_name} has no more units to move this turn. Waiting..."
             else:
                 action_prompt = "Objects are moving..."
-
 
         turn_text_surface = self.font.render(action_prompt, True, turn_indicator_color)
         turn_text_rect = turn_text_surface.get_rect(center=(SCREEN_WIDTH // 2, 30))
         self.screen.blit(turn_text_surface, turn_text_rect)
 
-        # 显示哪个单位已行动
         moved_status_texts_surfaces = []
-        y_offset_for_status = 50 # Starting Y for the status block
+        y_offset_for_status = 50
 
-        # Player 1 statuses
         p1_label_surf = self.font.render(f"P1 Units:", True, BLACK)
         self.screen.blit(p1_label_surf, (10, y_offset_for_status))
         current_y_p1 = y_offset_for_status + 25
@@ -314,22 +353,19 @@ class Game:
             self.screen.blit(text_surface, (10, current_y_p1))
             current_y_p1 += 20
 
-        # Player 2 statuses
         p2_label_text = f"P2 Units:"
         p2_label_size_x, _ = self.font.size(p2_label_text)
         p2_label_surf = self.font.render(p2_label_text, True, BLACK)
-        base_x_p2 = SCREEN_WIDTH - p2_label_size_x - 10 # Align to right
+        base_x_p2 = SCREEN_WIDTH - p2_label_size_x - 10
         self.screen.blit(p2_label_surf, (base_x_p2, y_offset_for_status))
         current_y_p2 = y_offset_for_status + 25
         for obj_idx, obj in enumerate(self.players_objects[1]):
             status = "Moved" if obj.has_moved_this_turn else "Ready"
             if obj.hp <=0: status = "KO"
             obj_text = f"  Obj {obj_idx+1}: {status}"
-            # To align text under P2 label, calculate its width or use a fixed offset from base_x_p2
             text_surface = self.font.render(obj_text, True, BLACK)
-            self.screen.blit(text_surface, (base_x_p2, current_y_p2)) # Simple alignment under label
+            self.screen.blit(text_surface, (base_x_p2, current_y_p2))
             current_y_p2 += 20
-
 
         if self.game_over:
             winner_name = "Player 1" if self.winner == 0 else "Player 2"
@@ -345,54 +381,49 @@ class Game:
 
         pygame.display.flip()
 
-
     def handle_input(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return False # 结束游戏循环
+                return False
 
             if self.game_over:
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_r: # 按R重新开始
-                    self.__init__() # 重新初始化游戏
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                    self.__init__()
                 continue
 
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1: # 左键按下
-                if self.all_objects_stopped(): # 只有所有物体都停止了才能操作
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.all_objects_stopped():
                     mouse_x, mouse_y = event.pos
                     for obj in self.players_objects[self.current_player_turn]:
-                        if obj.hp > 0 and not obj.has_moved_this_turn: # 只能选择自己未行动且存活的单位
+                        if obj.hp > 0 and not obj.has_moved_this_turn:
                             distance = math.hypot(obj.x - mouse_x, obj.y - mouse_y)
                             if distance <= obj.radius:
                                 self.selected_object = obj
                                 self.is_dragging = True
-                                self.drag_start_pos = (obj.x, obj.y) # 以物体中心为拖拽起点
+                                self.drag_start_pos = (obj.x, obj.y)
                                 break
 
-            if event.type == pygame.MOUSEBUTTONUP and event.button == 1: # 左键松开
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.is_dragging and self.selected_object:
-                    current_selected_object = self.selected_object # Assign to local variable
+                    current_selected_object = self.selected_object
 
                     mouse_x, mouse_y = event.pos
-                    # 计算拖拽向量 (从物体中心到鼠标松开位置的反方向)
                     dx = current_selected_object.x - mouse_x
                     dy = current_selected_object.y - mouse_y
 
-                    # 施加力，让物体弹射
-                    if current_selected_object.hp > 0 and not current_selected_object.has_moved_this_turn: # 再次确认
+                    if current_selected_object.hp > 0 and not current_selected_object.has_moved_this_turn:
                         current_selected_object.apply_force(dx, dy)
-                        self.action_processing_pending = True # 标记有动作发生，待处理
+                        self.action_processing_pending = True
                     self.is_dragging = False
-                    self.selected_object = None # 操作完成后取消选择
+                    self.selected_object = None
 
             if event.type == pygame.MOUSEMOTION:
                 if self.is_dragging and self.selected_object:
-                    current_selected_object = self.selected_object # Assign to local variable
+                    current_selected_object = self.selected_object
                     mouse_x, mouse_y = event.pos
-                    # Update object's angle to point from its center to the mouse cursor
                     drag_dx_from_center = mouse_x - current_selected_object.x
                     drag_dy_from_center = mouse_y - current_selected_object.y
                     current_selected_object.angle = math.atan2(drag_dy_from_center, drag_dx_from_center)
-                    # The drag line will be drawn based on this angle or mouse pos separately
         return True
 
     def update(self):
@@ -402,88 +433,105 @@ class Game:
         any_object_moving_after_launch = False
         for player_objs in self.players_objects:
             for obj in player_objs:
-                if obj.is_moving: # 只有移动中的物体才更新
+                if obj.is_moving:
                     obj.move()
                     obj.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
                     any_object_moving_after_launch = True
 
-        # 碰撞检测与处理
-        all_objects = self.players_objects[0] + self.players_objects[1]
-        for i in range(len(all_objects)):
-            for j in range(i + 1, len(all_objects)):
-                obj1 = all_objects[i]
-                obj2 = all_objects[j]
+        active_objects = [obj for player_list in self.players_objects for obj in player_list if obj.hp > 0]
 
-                if obj1.hp <= 0 or obj2.hp <= 0: continue # 跳过已淘汰的物体
+        for i in range(len(active_objects)):
+            for j in range(i + 1, len(active_objects)):
+                obj1 = active_objects[i]
+                obj2 = active_objects[j]
 
                 dist_x = obj1.x - obj2.x
                 dist_y = obj1.y - obj2.y
                 distance = math.hypot(dist_x, dist_y)
 
-                if distance == 0: # Avoid division by zero if objects are exactly at the same position
-                    # Slightly move one object to prevent being stuck
+                if distance == 0:
                     obj1.x += random.uniform(-0.1, 0.1)
                     obj1.y += random.uniform(-0.1, 0.1)
                     dist_x = obj1.x - obj2.x
                     dist_y = obj1.y - obj2.y
                     distance = math.hypot(dist_x, dist_y)
-                    if distance == 0: continue # Still zero, skip this pair for this frame
+                    if distance == 0: continue
 
+                min_dist = obj1.radius + obj2.radius
+                if distance < min_dist:
+                    overlap = min_dist - distance
+                    nx = dist_x / distance if distance != 0 else 1.0
+                    ny = dist_y / distance if distance != 0 else 0.0
 
-                if distance < obj1.radius + obj2.radius: # 发生碰撞
-                    # 法向量 (points from obj2 to obj1)
-                    nx = dist_x / distance
-                    ny = dist_y / distance
+                    inv_m1 = 1.0 / obj1.mass if obj1.mass > 0 else 0.0
+                    inv_m2 = 1.0 / obj2.mass if obj2.mass > 0 else 0.0
+                    total_inv_mass_correction = inv_m1 + inv_m2
 
-                    # 相对速度在法线方向上的投影
+                    if total_inv_mass_correction > 0:
+                        correction_factor_obj1 = inv_m1 / total_inv_mass_correction
+                        correction_factor_obj2 = inv_m2 / total_inv_mass_correction
+                        
+                        obj1.x += nx * overlap * correction_factor_obj1
+                        obj1.y += ny * overlap * correction_factor_obj1
+                        obj2.x -= nx * overlap * correction_factor_obj2
+                        obj2.y -= ny * overlap * correction_factor_obj2
+                    elif obj1.mass > 0:
+                        obj1.x += nx * overlap
+                        obj1.y += ny * overlap
+                    elif obj2.mass > 0:
+                        obj2.x -= nx * overlap
+                        obj2.y -= ny * overlap
+
                     rvx = obj1.vx - obj2.vx
                     rvy = obj1.vy - obj2.vy
                     vel_along_normal = rvx * nx + rvy * ny
 
-                    if vel_along_normal < 0: # 只有当物体相互靠近时才处理碰撞反弹
-                        # 使用冲量法处理碰撞 (考虑质量和弹性)
-                        e = (obj1.restitution)
+                    if vel_along_normal < 0:
+                        e = min(obj1.restitution, obj2.restitution)
 
-                        # 假设 obj1.mass 和 obj2.mass 是表示质量的属性。
-                        # 质量 <= 0 可以用来表示不可移动的物体（无限质量）。
-                        m1 = obj1.mass
-                        m2 = obj2.mass
+                        total_inv_mass_impulse = inv_m1 + inv_m2
 
-                        # 如果两个物体都不可移动或质量无效，则跳过冲量计算。
-                        # 这也防止了在两个质量都 <= 0 时发生除以零的错误。
-                        if m1 <= 0 and m2 <= 0:
-                            continue
+                        if total_inv_mass_impulse > 0:
+                            impulse_j = -(1 + e) * vel_along_normal / total_inv_mass_impulse
 
-                        inv_m1 = 1.0 / m1 if m1 > 0 else 0.0  # obj1 的逆质量
-                        inv_m2 = 1.0 / m2 if m2 > 0 else 0.0  # obj2 的逆质量
+                            obj1.vx += impulse_j * inv_m1 * nx
+                            obj1.vy += impulse_j * inv_m1 * ny
+                            obj2.vx -= impulse_j * inv_m2 * nx
+                            obj2.vy -= impulse_j * inv_m2 * ny
 
-                        # 用于冲量计算的总逆质量。
-                        total_inv_mass = inv_m1 + inv_m2
+                            if obj1.player_id != obj2.player_id:
+                                obj1.take_damage(obj2.attack, self.frame_count)
+                                obj2.take_damage(obj1.attack, self.frame_count)
 
-                        # 如果 total_inv_mass 为 0，意味着两个物体都不可移动。
-                        # （如果上面的 (m1 <= 0 and m2 <= 0) 检查是全面的，这个检查有些多余，
-                        # 但作为一个安全措施是好的，特别是如果 m1 或 m2 可能因其他原因为负）。
-                        if total_inv_mass == 0:
-                            continue
+        if self.action_processing_pending and self.all_objects_stopped():
+            self.action_processing_pending = False
 
-                        # 计算冲量标量
-                        # 冲量 j 的公式是：j = -(1 + e) * v_rel_normal / (1/m1 + 1/m2)
-                        impulse_j = -(1 + e) * vel_along_normal / total_inv_mass
+            score_occurred_and_reset = self.check_object_destruction_and_scoring()
 
-                        # 应用冲量来更新速度
-                        # 速度变化 = 冲量 / 质量 * 法向量
-                        # (冲量 / 质量) 等于 (冲量 * 逆质量)
-                        obj1.vx += impulse_j * inv_m1 * nx
-                        obj1.vy += impulse_j * inv_m1 * ny
-                        obj2.vx -= impulse_j * inv_m2 * nx # obj2 受到的冲量方向相反
-                        obj2.vy -= impulse_j * inv_m2 * ny
+            if self.game_over:
+                return
+
+            if not score_occurred_and_reset:
+                player_who_just_moved = self.current_player_turn
+                potential_next_player = 1 - player_who_just_moved
+
+                can_potential_next_player_move = self.can_player_move(potential_next_player)
+                can_player_who_just_moved_still_move = self.can_player_move(player_who_just_moved)
+
+                if can_potential_next_player_move:
+                    self.current_player_turn = potential_next_player
+                    print(f"Player {player_who_just_moved + 1} finished move. Now Player {self.current_player_turn + 1}'s turn.")
+                elif can_player_who_just_moved_still_move:
+                    print(f"Player {potential_next_player + 1} has no more moves. Player {self.current_player_turn + 1} continues.")
+                else:
+                    self.next_round()
 
 # --- 主程序循环 ---
 if __name__ == '__main__':
     game = Game()
     running = True
     while running:
-        if not game.handle_input(): # handle_input 返回 False 时退出循环
+        if not game.handle_input():
             running = False
             break
 
@@ -491,7 +539,6 @@ if __name__ == '__main__':
         game.draw()
 
         game.clock.tick(FPS)
-        game.frame_count += 1 # 更新游戏帧计数
+        game.frame_count += 1
 
     pygame.quit()
-
