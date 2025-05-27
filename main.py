@@ -1,6 +1,6 @@
 import pygame
-import random
 import math
+import random
 from typing import List, Optional
 
 # --- 常量 ---
@@ -20,6 +20,7 @@ OBJECT_RADIUS = 20
 INITIAL_HP = 20
 INITIAL_ATTACK = 10
 MAX_VICTORY_POINTS = 5 # 胜利点数
+MAX_PULL_RADIUS_MULTIPLIER = 4.0 # Max pull distance as a multiplier of object radius
 
 # --- 游戏对象类 ---
 class GameObject:
@@ -97,18 +98,18 @@ class GameObject:
     def check_boundary_collision(self, screen_width, screen_height):
         if self.x - self.radius < 0:
             self.x = self.radius
-            self.vx *= -1
+            self.vx *= -self.restitution # Apply restitution
         elif self.x + self.radius > screen_width:
             self.x = screen_width - self.radius
-            self.vx *= -1
+            self.vx *= -self.restitution # Apply restitution
         if self.y - self.radius < 0:
             self.y = self.radius
-            self.vy *= -1
+            self.vy *= -self.restitution # Apply restitution
         elif self.y + self.radius > screen_height:
             self.y = screen_height - self.radius
-            self.vy *= -1
+            self.vy *= -self.restitution # Apply restitution
 
-    def apply_force(self, dx, dy, strength_multiplier=0.08): # Slightly increased launch strength
+    def apply_force(self, dx, dy, strength_multiplier=0.08 * 4): # Slightly increased launch strength
         self.vx = -dx * strength_multiplier
         self.vy = -dy * strength_multiplier
         self.is_moving = True
@@ -133,7 +134,7 @@ class GameObject:
         self.is_moving = False
         self.angle = 0.0
         self.angular_velocity = 0.0
-        self.has_moved_this_turn = False # Ensure it's ready to move again
+        # self.has_moved_this_turn = False # Removed: Preserve move status
         self.last_damaged_frame = -1000 # Reset damage cooldown
         # self.mass and self.moment_of_inertia remain as initialized
 
@@ -254,18 +255,118 @@ class Game:
             mouse_x, mouse_y = pygame.mouse.get_pos()
             obj_center_x, obj_center_y = self.selected_object.x, self.selected_object.y
 
-            dx_mouse = mouse_x - obj_center_x
-            dy_mouse = mouse_y - obj_center_y
+            drag_visual_dx = mouse_x - obj_center_x
+            drag_visual_dy = mouse_y - obj_center_y
+            current_pull_distance = math.hypot(drag_visual_dx, drag_visual_dy)
 
-            launch_vx = -dx_mouse
-            launch_vy = -dy_mouse
+            # Consistent maximum pull distance for visuals and force projection
+            max_effective_pull_pixels = MAX_PULL_RADIUS_MULTIPLIER * OBJECT_RADIUS
 
-            line_length_factor = 0.5
-            end_line_x = obj_center_x + launch_vx * line_length_factor
-            end_line_y = obj_center_y + launch_vy * line_length_factor
+            # Limit the visual length of the slingshot pull line
+            display_dx = drag_visual_dx
+            display_dy = drag_visual_dy
 
-            pygame.draw.line(self.screen, GREEN, (obj_center_x, obj_center_y), (end_line_x, end_line_y), 2)
-            pygame.draw.circle(self.screen, GREEN, (int(end_line_x), int(end_line_y)), 5)
+            if current_pull_distance > max_effective_pull_pixels: # Use consistent cap
+                if current_pull_distance > 0:
+                    scale_factor = max_effective_pull_pixels / current_pull_distance
+                    display_dx = drag_visual_dx * scale_factor
+                    display_dy = drag_visual_dy * scale_factor
+                else:
+                    display_dx, display_dy = 0,0
+
+            # Draw the slingshot band (from object towards mouse)
+            slingshot_band_end_x = obj_center_x + display_dx
+            slingshot_band_end_y = obj_center_y + display_dy
+            pygame.draw.line(self.screen, RED, (obj_center_x, obj_center_y), (slingshot_band_end_x, slingshot_band_end_y), 3)
+            pygame.draw.circle(self.screen, RED, (int(slingshot_band_end_x), int(slingshot_band_end_y)), 6)
+
+            # --- Projected path (dotted line) ---
+            launch_force_dir_x = obj_center_x - mouse_x
+            launch_force_dir_y = obj_center_y - mouse_y
+
+            scaled_launch_force_dx = launch_force_dir_x
+            scaled_launch_force_dy = launch_force_dir_y
+            
+            # Cap the pull distance for force calculation (used for projection)
+            if current_pull_distance > max_effective_pull_pixels: # Use consistent cap
+                if current_pull_distance > 0:
+                    force_scale = max_effective_pull_pixels / current_pull_distance
+                    scaled_launch_force_dx = launch_force_dir_x * force_scale
+                    scaled_launch_force_dy = launch_force_dir_y * force_scale
+                else:
+                    scaled_launch_force_dx, scaled_launch_force_dy = 0,0
+            elif current_pull_distance < 5: # Minimal pull threshold
+                 scaled_launch_force_dx, scaled_launch_force_dy = 0,0
+
+            strength_multiplier = 0.08 * 4 # Synchronized with apply_force
+            proj_vx = scaled_launch_force_dx * strength_multiplier 
+            proj_vy = scaled_launch_force_dy * strength_multiplier
+
+            temp_x, temp_y = obj_center_x, obj_center_y
+            num_projection_points = 60 
+            friction_coefficient = 0.98 
+            proj_radius = self.selected_object.radius
+
+            if scaled_launch_force_dx == 0 and scaled_launch_force_dy == 0:
+                pass 
+            else:
+                for i in range(num_projection_points):
+                    temp_x += proj_vx
+                    temp_y += proj_vy
+                    proj_vx *= friction_coefficient
+                    proj_vy *= friction_coefficient
+
+                    # --- Object-Object Collision Check for Projection ---
+                    collided_with_object_this_step = False
+                    for player_objs_list in self.players_objects:
+                        if collided_with_object_this_step: break
+                        for other_obj in player_objs_list:
+                            if other_obj is self.selected_object or other_obj.hp <= 0:
+                                continue
+                            
+                            dist_to_other = math.hypot(temp_x - other_obj.x, temp_y - other_obj.y)
+                            if dist_to_other < proj_radius + other_obj.radius:
+                                # Collision detected
+                                if dist_to_other == 0: # Avoid division by zero
+                                    collision_nx, collision_ny = 1.0, 0.0 # Arbitrary normal
+                                else:
+                                    collision_nx = (temp_x - other_obj.x) / dist_to_other
+                                    collision_ny = (temp_y - other_obj.y) / dist_to_other
+
+                                # Reflect velocity (simple reflection off a static object, now with restitution)
+                                effective_restitution = min(self.selected_object.restitution, other_obj.restitution)
+
+                                dot_product = proj_vx * collision_nx + proj_vy * collision_ny
+                                proj_vx -= (1 + effective_restitution) * dot_product * collision_nx
+                                proj_vy -= (1 + effective_restitution) * dot_product * collision_ny
+                                
+                                # Adjust position to be just outside the collided object
+                                overlap = (proj_radius + other_obj.radius) - dist_to_other
+                                temp_x += collision_nx * (overlap + 0.1) # Epsilon to prevent sticking
+                                temp_y += collision_ny * (overlap + 0.1)
+                                
+                                collided_with_object_this_step = True
+                                break # Processed one collision, move to next projection step / boundary check
+                    
+                    # Boundary check for projection
+                    if temp_x - proj_radius < 0:
+                        temp_x = proj_radius
+                        proj_vx *= -self.selected_object.restitution # Use object's restitution
+                    elif temp_x + proj_radius > SCREEN_WIDTH:
+                        temp_x = SCREEN_WIDTH - proj_radius
+                        proj_vx *= -self.selected_object.restitution
+                    if temp_y - proj_radius < 0:
+                        temp_y = proj_radius
+                        proj_vy *= -self.selected_object.restitution
+                    elif temp_y + proj_radius > SCREEN_HEIGHT:
+                        temp_y = SCREEN_HEIGHT - proj_radius
+                        proj_vy *= -self.selected_object.restitution
+                    
+                    if abs(proj_vx) < 0.01 and abs(proj_vy) < 0.01: 
+                        break
+
+                    if i % 3 == 0: 
+                        pygame.draw.circle(self.screen, BLACK, (int(temp_x), int(temp_y)), 2)
 
     def draw(self):
         self.screen.fill(WHITE)
@@ -352,32 +453,53 @@ class Game:
 
             if self.game_over:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                    self.__init__()
+                    self.__init__() 
                 continue
 
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self.all_objects_stopped():
+                if self.all_objects_stopped(): 
                     mouse_x, mouse_y = event.pos
                     for obj in self.players_objects[self.current_player_turn]:
                         if obj.hp > 0 and not obj.has_moved_this_turn:
                             distance = math.hypot(obj.x - mouse_x, obj.y - mouse_y)
-                            if distance <= obj.radius:
+                            if distance <= obj.radius: 
                                 self.selected_object = obj
                                 self.is_dragging = True
-                                self.drag_start_pos = (obj.x, obj.y)
+                                self.drag_start_pos = (obj.x, obj.y) 
                                 break
 
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.is_dragging and self.selected_object:
                     current_selected_object = self.selected_object
+                    mouse_x, mouse_y = event.pos 
 
-                    mouse_x, mouse_y = event.pos
-                    dx = current_selected_object.x - mouse_x
-                    dy = current_selected_object.y - mouse_y
+                    raw_launch_vec_x = current_selected_object.x - mouse_x
+                    raw_launch_vec_y = current_selected_object.y - mouse_y
+                    
+                    pull_distance = math.hypot(raw_launch_vec_x, raw_launch_vec_y)
+                    # Use the consistent max pull strength based on the global multiplier
+                    max_pull_strength_pixels = MAX_PULL_RADIUS_MULTIPLIER * OBJECT_RADIUS 
+
+                    scaled_launch_dx = raw_launch_vec_x
+                    scaled_launch_dy = raw_launch_vec_y
+
+                    if pull_distance > max_pull_strength_pixels:
+                        if pull_distance > 0: 
+                            scale = max_pull_strength_pixels / pull_distance
+                            scaled_launch_dx = raw_launch_vec_x * scale
+                            scaled_launch_dy = raw_launch_vec_y * scale
+                        else: 
+                            scaled_launch_dx, scaled_launch_dy = 0,0
+                    if pull_distance < 5: 
+                        scaled_launch_dx, scaled_launch_dy = 0,0
 
                     if current_selected_object.hp > 0 and not current_selected_object.has_moved_this_turn:
-                        current_selected_object.apply_force(dx, dy)
-                        self.action_processing_pending = True
+                        if scaled_launch_dx != 0 or scaled_launch_dy != 0: 
+                            dx_param_for_apply_force = -scaled_launch_dx
+                            dy_param_for_apply_force = -scaled_launch_dy
+                            current_selected_object.apply_force(dx_param_for_apply_force, dy_param_for_apply_force)
+                            self.action_processing_pending = True
+                    
                     self.is_dragging = False
                     self.selected_object = None
 
@@ -542,7 +664,7 @@ class Game:
                 self.current_player_turn = potential_next_player
                 print(f"Player {player_who_just_moved + 1} finished move. Now Player {self.current_player_turn + 1}'s turn.")
             elif can_player_who_just_moved_still_move:
-                print(f"Player {potential_next_player + 1} has no more moves. Player {self.current_player_turn + 1} continues.")
+                print(f"Player {potential_next_player + 1} has no more moves. Player {self.current_turn + 1} continues.")
             else:
                 self.next_round()
 
