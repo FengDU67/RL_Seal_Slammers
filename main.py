@@ -16,9 +16,9 @@ BLUE = (0, 0, 255)
 GREEN = (0, 255, 0)
 
 # 游戏参数
-OBJECT_RADIUS = 20
-INITIAL_HP = 20
-INITIAL_ATTACK = 10
+OBJECT_RADIUS = 23
+INITIAL_HP = 40
+INITIAL_ATTACK = 8
 MAX_VICTORY_POINTS = 5 # 胜利点数
 MAX_PULL_RADIUS_MULTIPLIER = 4.0 # Max pull distance as a multiplier of object radius
 
@@ -42,11 +42,11 @@ class GameObject:
         self.original_y = y # For respawning
         self.angle = 0.0 # 物体当前角度 (弧度)
         self.angular_velocity = 0.0 # 物体角速度 (弧度/帧)
-        self.mass = 5.0 # 质量 (可调)
-        self.restitution = 0.8 # 弹性系数 (0-1, 越大越弹, 可调)
+        self.mass = 6.0 # 质量 (可调)
+        self.restitution = 1.0 # 弹性系数 (0-1, 越大越弹, 可调)
         self.moment_of_inertia = 0.5 * self.mass * self.radius**2
         self.last_damaged_frame = -1000 # 上次受到伤害的帧数，初始化为很久以前
-        self.damage_intake_cooldown_frames = 15 # 受到伤害后的冷却帧数 (例如 15帧 ~= 0.25秒 @60FPS, 可调)
+        self.damage_intake_cooldown_frames = 10 # 受到伤害后的冷却帧数 (例如 15帧 ~= 0.25秒 @60FPS, 可调)
 
     def draw(self, screen):
         pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
@@ -471,7 +471,8 @@ class Game:
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.is_dragging and self.selected_object:
                     current_selected_object = self.selected_object
-                    mouse_x, mouse_y = event.pos 
+                    # Use pygame.mouse.get_pos() for consistency with draw_drag_line
+                    mouse_x, mouse_y = pygame.mouse.get_pos()
 
                     raw_launch_vec_x = current_selected_object.x - mouse_x
                     raw_launch_vec_y = current_selected_object.y - mouse_y
@@ -507,9 +508,14 @@ class Game:
                 if self.is_dragging and self.selected_object:
                     current_selected_object = self.selected_object
                     mouse_x, mouse_y = event.pos
-                    drag_dx_from_center = mouse_x - current_selected_object.x
-                    drag_dy_from_center = mouse_y - current_selected_object.y
-                    current_selected_object.angle = math.atan2(drag_dy_from_center, drag_dx_from_center)
+                    # Calculate the vector from the object to the mouse
+                    # drag_dx_from_center = mouse_x - current_selected_object.x
+                    # drag_dy_from_center = mouse_y - current_selected_object.y
+                    # To make the indicator point in the launch direction (opposite to drag):
+                    # The launch direction vector is (object_center_x - mouse_x, object_center_y - mouse_y)
+                    launch_dir_x = current_selected_object.x - mouse_x
+                    launch_dir_y = current_selected_object.y - mouse_y
+                    current_selected_object.angle = math.atan2(launch_dir_y, launch_dir_x)
         return True
 
     def update(self):
