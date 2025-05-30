@@ -1,9 +1,9 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
 import pygame
-import math
-import random # For potential use in game logic like random start
+from gymnasium import spaces
+import gymnasium as gym # Added
+import numpy as np # Added
+import math # Added
+import random # Added
 
 # --- Game Constants (Copied and merged from main.py and existing env) ---
 SCREEN_WIDTH, SCREEN_HEIGHT = 1000, 600
@@ -20,6 +20,7 @@ LIGHT_GREY = (200, 200, 200) # Used as background in main.py draw
 OBJECT_RADIUS = 23 # Updated from main.py
 INITIAL_HP = 40    # Updated from main.py
 INITIAL_ATTACK = 8 # Updated from main.py
+MAX_LAUNCH_STRENGTH_RL = 20.0 # Added for RL action scaling
 # MAX_LAUNCH_STRENGTH = 200 # This is more related to RL action scaling
 FORCE_MULTIPLIER = 0.08 * 4 # Adjusted to match main.py's effective multiplier
 FRICTION = 0.98 
@@ -74,23 +75,32 @@ class GameObject:
         self.vx = -dx * strength_multiplier 
         self.vy = -dy * strength_multiplier
         self.is_moving = True
-        self.has_moved_this_turn = True
+        self.has_moved_this_turn = True # Consistent with main.py
         # print(f"DEBUG: P{self.player_id+1}-Obj{self.object_id} force applied: vx={self.vx:.1f}, vy={self.vy:.1f}")
 
     def move(self):
-        if not self.is_moving:
-            return
+        if self.is_moving:
+            self.x += self.vx
+            self.y += self.vy
 
-        self.x += self.vx
-        self.y += self.vy
+            self.vx *= FRICTION 
+            self.vy *= FRICTION
+            
+            # REMOVED: Logic to update angle based on velocity vector.
+            # The object's angle will now persist after launch,
+            # instead of aligning with the velocity vector during movement.
+            # if self.vx != 0 or self.vy != 0: # Only update angle if moving
+            #     self.angle = math.atan2(self.vy, self.vx) # Angle faces direction of movement
 
-        self.vx *= FRICTION
-        self.vy *= FRICTION
+            if math.hypot(self.vx, self.vy) < MIN_SPEED_THRESHOLD:
+                self.vx = 0
+                self.vy = 0
+                self.is_moving = False
+                self.angular_velocity = 0 # Stop spinning if it was spinning
 
-        if math.sqrt(self.vx**2 + self.vy**2) < MIN_SPEED_THRESHOLD:
-            self.vx = 0
-            self.vy = 0
-            self.is_moving = False
+        # Update angle from angular velocity (for spinning effect) - this remains
+        self.angle += self.angular_velocity
+        self.angular_velocity *= 0.97 # Angular friction/damping (TODO: Use a constant like ANGULAR_FRICTION)
 
     def check_boundary_collision(self, screen_width, screen_height):
         if self.x - self.radius < 0:
@@ -120,22 +130,22 @@ class GameObject:
             self.hp = 0
         return True # Damage applied
 
-    def respawn(self):
+    def respawn(self, new_x=None, new_y=None): # Modified to accept new_x, new_y
         self.hp = self.initial_hp
-        self.x = self.original_x
-        self.y = self.original_y
+        self.x = new_x if new_x is not None else self.original_x # Use new position if provided
+        self.y = new_y if new_y is not None else self.original_y # Use new position if provided
         self.vx = 0.0
         self.vy = 0.0
         self.is_moving = False
-        self.has_moved_this_turn = False
+        # self.has_moved_this_turn = False # Reset by next_round or turn logic, not individually here
         self.angle = 0.0
         self.angular_velocity = 0.0
         self.last_damaged_frame = - DAMAGE_COOLDOWN_FRAMES * 2
 
 
     def draw(self, surface, font_small, font_hp_atk): # Added font_hp_atk
-        if self.hp <= 0 and False: # Simplified: KO'd objects are just not drawn by main loop or drawn differently
-            return
+        if self.hp <= 0: # If HP is 0 or less, do not draw the object
+            return       # This makes it disappear
 
         # Draw circle (same as main.py)
         pygame.draw.circle(surface, self.color, (int(self.x), int(self.y)), self.radius)
@@ -159,7 +169,7 @@ class GameObject:
             line_end_y = self.y + self.radius * math.sin(self.angle)
             pygame.draw.line(surface, BLACK, (self.x, self.y), (line_end_x, line_end_y), 2)
 
-        if self.has_moved_this_turn and self.hp > 0: # Highlight if moved (like in main.py)
+        if self.has_moved_this_turn: # Highlight if moved (like in main.py) - Removed 'and self.hp > 0' for consistency
             pygame.draw.circle(surface, GREEN, (int(self.x), int(self.y)), self.radius + 3, 2)
         
         # Draw object ID (from original env.py, useful for RL debugging)
@@ -184,12 +194,14 @@ class Game:
             self.font_hp_atk = pygame.font.SysFont(None, 18) # For HP/ATK text like in main.py
             self.clock = pygame.time.Clock()
         else: # Headless or for rgb_array
+            # Initialize fonts even in headless mode for potential rgb_array rendering
+            if not pygame.get_init(): pygame.init() # Pygame needs to be init for fonts
             if not pygame.font.get_init(): pygame.font.init()
-            self.font = pygame.font.SysFont(None, 30) # Font might be needed for rgb_array text
+            self.font = pygame.font.SysFont(None, 30) 
             self.font_small = pygame.font.SysFont(None, 18)
-            self.font_hp_atk = pygame.font.SysFont(None, 18) # Also for rgb_array text
+            self.font_hp_atk = pygame.font.SysFont(None, 18)
             self.screen = None 
-            self.clock = None
+            self.clock = None # Clock not typically used in headless RL steps unless for FPS matching
 
         self.players_objects: list[list[GameObject]] = []
         self.scores = [0, 0]
@@ -206,6 +218,11 @@ class Game:
         # self.drag_start_pos = None
         # self.drag_current_pos = None
         
+        # Constants for respawn logic
+        self._RESPAWN_SEARCH_STEP_DISTANCE_FACTOR = 0.75 # Factor of object radius
+        self._RESPAWN_MAX_SPIRAL_LAYERS = 8
+        self._RESPAWN_POINTS_PER_LAYER = 8
+
         self._initialize_objects() # Initialize objects upon creation
         # self.reset_game_state() # reset_game_state will also call _initialize_objects
 
@@ -254,6 +271,89 @@ class Game:
         self._initialize_objects() # Re-create objects for a clean state
         # print("DEBUG: Game state reset (internal Game class).")
 
+    def all_objects_stopped(self): # Added from main.py
+        for player_objs in self.players_objects:
+            for obj in player_objs:
+                if obj.is_moving:
+                    return False
+        return True
+
+    def can_player_move(self, player_id: int) -> bool: # Added from main.py
+        """Checks if the specified player has any units that can still move."""
+        for obj in self.players_objects[player_id]:
+            if obj.hp > 0 and not obj.has_moved_this_turn:
+                return True
+        return False
+
+    def object_has_moved_this_turn(self, player_id: int, object_idx_in_player_list: int) -> bool:
+        if 0 <= player_id < len(self.players_objects) and \
+           0 <= object_idx_in_player_list < len(self.players_objects[player_id]):
+            return self.players_objects[player_id][object_idx_in_player_list].has_moved_this_turn
+        # If indices are out of bounds, or object doesn't exist,
+        # consider it as "cannot be moved" or "has effectively moved / is not available".
+        # This prevents errors if play.py tries to check an invalid index.
+        return True
+
+
+    def next_round(self): # Added from main.py
+        # print("DEBUG ENV: Round ended, switching first player for next round.")
+        self.first_player_of_round = 1 - self.first_player_of_round
+        self.current_player_turn = self.first_player_of_round
+        for player_objs in self.players_objects:
+            for obj in player_objs:
+                obj.has_moved_this_turn = False # Reset all units' move status
+        # print(f"DEBUG ENV: Next round. Player {self.current_player_turn + 1} starts.")
+
+
+    def _check_overlap_at_pos(self, x, y, radius, object_to_exclude=None):
+        """Checks if an object at (x,y) with radius would overlap with other active objects."""
+        for player_list in self.players_objects:
+            for other_obj in player_list:
+                if other_obj is object_to_exclude or other_obj.hp <= 0:
+                    continue # Don't check against self or KO'd objects
+
+                dist_sq = (x - other_obj.x)**2 + (y - other_obj.y)**2
+                min_dist_sq = (radius + other_obj.radius)**2
+                if dist_sq < min_dist_sq - 1e-6: # Added tolerance for floating point
+                    return True # Overlap detected
+        return False # No overlap
+
+    def _find_non_overlapping_spawn_position(self, object_being_respawned, preferred_x, preferred_y):
+        """
+        Finds a non-overlapping position for the object_being_respawned,
+        starting from preferred_x, preferred_y and searching outwards if needed.
+        """
+        obj_radius = object_being_respawned.radius
+
+        # Try preferred position first
+        if not self._check_overlap_at_pos(preferred_x, preferred_y, obj_radius, object_being_respawned):
+            return preferred_x, preferred_y
+
+        # Spiral search outwards
+        search_step_distance = obj_radius * self._RESPAWN_SEARCH_STEP_DISTANCE_FACTOR
+
+        for layer in range(1, self._RESPAWN_MAX_SPIRAL_LAYERS + 1):
+            current_search_dist = layer * search_step_distance
+            for i in range(self._RESPAWN_POINTS_PER_LAYER):
+                # Add a slight angle offset for each layer to ensure points don't always align
+                angle_offset = (math.pi / self._RESPAWN_POINTS_PER_LAYER) * (layer % 2) 
+                angle = (2 * math.pi / self._RESPAWN_POINTS_PER_LAYER) * i + angle_offset
+                
+                candidate_x = preferred_x + current_search_dist * math.cos(angle)
+                candidate_y = preferred_y + current_search_dist * math.sin(angle)
+
+                # Clamp to screen boundaries
+                candidate_x = max(obj_radius, min(candidate_x, SCREEN_WIDTH - obj_radius))
+                candidate_y = max(obj_radius, min(candidate_y, SCREEN_HEIGHT - obj_radius))
+
+                if not self._check_overlap_at_pos(candidate_x, candidate_y, obj_radius, object_being_respawned):
+                    return candidate_x, candidate_y
+        
+        # Fallback: return preferred position even if it overlaps (should be rare)
+        # print(f"WARN: Could not find non-overlapping spawn for P{object_being_respawned.player_id}-Obj{object_being_respawned.object_id}, using preferred.")
+        return preferred_x, preferred_y
+
+
     def _simulate_frame_physics_and_damage(self):
         """
         Simulates one frame of game physics: movement, boundary collisions,
@@ -274,10 +374,10 @@ class Game:
                 if obj.is_moving:
                     obj.move()
                     obj.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
-                    if obj.is_moving:
+                    if obj.is_moving: # Check again as move() might set it to False
                         any_object_activity_this_frame = True
         
-        # 2. Handle collisions and damage
+        # 2. Handle collisions and damage (Ported from main.py Game.update)
         active_objects = [obj for player_list in self.players_objects for obj in player_list if obj.hp > 0]
         for i in range(len(active_objects)):
             for j in range(i + 1, len(active_objects)):
@@ -287,16 +387,22 @@ class Game:
                 dist_x = obj1.x - obj2.x
                 dist_y = obj1.y - obj2.y
                 distance = math.hypot(dist_x, dist_y)
+
+                if distance == 0: # Avoid division by zero
+                    obj1.x += random.uniform(-0.1, 0.1)
+                    obj1.y += random.uniform(-0.1, 0.1)
+                    dist_x = obj1.x - obj2.x; dist_y = obj1.y - obj2.y
+                    distance = math.hypot(dist_x, dist_y)
+                    if distance == 0: continue
+
                 min_dist = obj1.radius + obj2.radius
-
-                if distance < min_dist: # Collision
-                    any_object_activity_this_frame = True
-
-                    # Overlap Resolution (closer to main.py's logic)
+                if distance < min_dist:
+                    any_object_activity_this_frame = True # Collision occurred
+                    # --- Overlap Resolution (from main.py) ---
                     overlap = min_dist - distance
-                    nx = (dist_x / distance) if distance != 0 else 1.0
-                    ny = (dist_y / distance) if distance != 0 else 0.0
-                    
+                    nx = dist_x / distance if distance != 0 else 1.0
+                    ny = dist_y / distance if distance != 0 else 0.0
+
                     inv_m1 = 1.0 / obj1.mass if obj1.mass > 0 else 0.0
                     inv_m2 = 1.0 / obj2.mass if obj2.mass > 0 else 0.0
                     total_inv_mass_correction = inv_m1 + inv_m2
@@ -304,518 +410,446 @@ class Game:
                     if total_inv_mass_correction > 0:
                         correction_factor_obj1 = inv_m1 / total_inv_mass_correction
                         correction_factor_obj2 = inv_m2 / total_inv_mass_correction
-                        
                         obj1.x += nx * overlap * correction_factor_obj1
                         obj1.y += ny * overlap * correction_factor_obj1
                         obj2.x -= nx * overlap * correction_factor_obj2
                         obj2.y -= ny * overlap * correction_factor_obj2
-                    elif obj1.mass > 0: # Only obj1 has mass
-                        obj1.x += nx * overlap
-                        obj1.y += ny * overlap
-                    elif obj2.mass > 0: # Only obj2 has mass
-                        obj2.x -= nx * overlap
-                        obj2.y -= ny * overlap
-
-
-                    # Impulse Calculation (closer to main.py)
+                    elif obj1.mass > 0: obj1.x += nx * overlap; obj1.y += ny * overlap
+                    elif obj2.mass > 0: obj2.x -= nx * overlap; obj2.y -= ny * overlap
+                    
+                    # --- Impulse Calculation (from main.py) ---
                     rvx = obj1.vx - obj2.vx
                     rvy = obj1.vy - obj2.vy
                     vel_along_normal = rvx * nx + rvy * ny
 
-                    if vel_along_normal < 0: # Moving towards each other
-                        e = min(obj1.restitution, obj2.restitution) # Use objects' restitution
-                        
+                    if vel_along_normal < 0: # Objects are moving towards each other
+                        e = min(obj1.restitution, obj2.restitution)
                         total_inv_mass_impulse = inv_m1 + inv_m2
                         if total_inv_mass_impulse > 0:
                             impulse_j = -(1 + e) * vel_along_normal / total_inv_mass_impulse
-                            
                             obj1.vx += impulse_j * inv_m1 * nx
                             obj1.vy += impulse_j * inv_m1 * ny
                             obj2.vx -= impulse_j * inv_m2 * nx
                             obj2.vy -= impulse_j * inv_m2 * ny
-                            
-                            obj1.is_moving = True # Mark as moving if impulse applied
-                            obj2.is_moving = True
-                            any_object_activity_this_frame = True
 
+                            if abs(obj1.vx) > 0.01 or abs(obj1.vy) > 0.01: obj1.is_moving = True
+                            if abs(obj2.vx) > 0.01 or abs(obj2.vy) > 0.01: obj2.is_moving = True
 
-                        # Damage Application (using take_damage method)
-                        if obj1.player_id != obj2.player_id: # No friendly fire
-                            # Determine attacker/defender based on current turn, or apply symmetrically if not turn-based damage
-                            # For simplicity here, let's assume damage is mutual on collision if they are enemies.
-                            # main.py's damage logic in update() is more nuanced based on current_player_turn.
-                            # For RL, direct collision damage might be simpler.
-                            # Let's refine this: only the object belonging to the *other* player takes damage from *this* player's object if it's a direct result of this player's action.
-                            # However, the current structure of _simulate_frame_physics_and_damage is general.
-                            # We'll use the take_damage method which includes cooldown.
+                            # --- Damage Application (from main.py) ---
+                            if obj1.player_id != obj2.player_id:
+                                # Determine attacker (current player's object involved in collision)
+                                # and defender (opponent's object)
+                                # For RL, the "current_player_turn" is the one whose action initiated movement.
+                                # If obj1 or obj2 was the one launched by current_player_turn, or
+                                # became active due to that launch.
+                                # Simpler: if one is current_player_turn's team and other is not.
+                                # Let's assume damage is dealt by the object of the player whose turn it *was*
+                                # when the action was taken. This is stored in env.game.current_player_turn
+                                # (which is `current_player_id` in the step function before this simulation)
+                                # This part is tricky. main.py uses self.current_player_turn.
+                                # For the env, the "active" player for damage dealing should be the one
+                                # whose action is currently being processed.
+                                # Let's assume the `self.current_player_turn` in Game class reflects who *initiated* the action.
+                                
+                                attacker_obj, defender_obj = None, None
+                                if obj1.player_id == self.current_player_turn and obj2.player_id != self.current_player_turn:
+                                    attacker_obj, defender_obj = obj1, obj2
+                                elif obj2.player_id == self.current_player_turn and obj1.player_id != self.current_player_turn:
+                                    attacker_obj, defender_obj = obj2, obj1
 
-                            # Simplified: if obj1 hits obj2 (enemy), obj2 takes damage from obj1.attack. And vice-versa.
-                            # This part needs to be careful to avoid double-damaging or incorrect attribution.
-                            # Let's assume the "active" object (one that was likely launched) deals damage.
-                            # This is hard to determine here without more context of which object initiated.
-                            # For now, using main.py's logic: if they collide, they both can take damage from each other.
-                            
-                            obj1_took_damage = False
-                            obj2_took_damage = False
+                                if attacker_obj and defender_obj:
+                                    damaged = defender_obj.take_damage(attacker_obj.attack, self.frame_count)
+                                    if damaged and defender_obj.hp <= 0:
+                                        scoring_player_id = attacker_obj.player_id
+                                        self.scores[scoring_player_id] += 1
+                                        # print(f"DEBUG ENV: Player {scoring_player_id + 1} scores. Scores: {self.scores}")
+                                        if self.scores[scoring_player_id] >= MAX_VICTORY_POINTS:
+                                            self.game_over = True
+                                            self.winner = scoring_player_id
+                                            # print(f"DEBUG ENV: Player {self.winner + 1} wins!")
+                                            return False # Game ended, stop simulation
 
-                            # Obj1 attempts to damage Obj2
-                            if obj2.take_damage(obj1.attack, self.frame_count):
-                                obj1_took_damage = True # Incorrect variable name, should be obj2_damaged_by_obj1
-                                if obj2.hp <= 0:
-                                    self.scores[obj1.player_id] += 1
-                                    # print(f"DEBUG: P{obj1.player_id} KO'd P{obj2.player_id}'s obj. Score: {self.scores}")
-
-
-                            # Obj2 attempts to damage Obj1
-                            if obj1.take_damage(obj2.attack, self.frame_count):
-                                obj2_took_damage = True # Incorrect, should be obj1_damaged_by_obj2
-                                if obj1.hp <= 0:
-                                    self.scores[obj2.player_id] += 1
-                                    # print(f"DEBUG: P{obj2.player_id} KO'd P{obj1.player_id}'s obj. Score: {self.scores}")
-                    
-                    obj1.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT) 
+                    obj1.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
                     obj2.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
 
-        # 3. Check for game over (victory points)
-        if not self.game_over:
-            for p_id in range(len(self.scores)):
-                if self.scores[p_id] >= MAX_VICTORY_POINTS:
-                    self.game_over = True
-                    self.winner = p_id
-                    break
-        return any_object_activity_this_frame
+        # Removed old scoring logic based on team wipe. Scoring is per KO now.
+        # Game over is checked per KO.
 
-    def _handle_turn_progression_after_action(self):
-        """Handles turn progression after an action has resolved and objects stopped."""
-        if self.game_over:
+        if not any_object_activity_this_frame:
+            return False # All objects are stationary
+
+        return True # Objects were active or collision occurred
+
+    def _reset_round_for_scoring(self):
+        # This method is no longer used in the same way as main.py.
+        # main.py respawns all KO'd units at the end of an action sequence,
+        # and starts a new round if no player can move.
+        # Kept for now in case it's needed for a different game mode, but current logic won't call it.
+        pass
+
+    def draw_game_state(self, surface):
+        if self.headless_mode and surface is None: # Added check for surface is None for rgb_array case if game is headless
+            # If truly headless and no surface provided (e.g. for pure logic steps), do nothing.
+            # However, rgb_array mode in Env will provide a surface.
             return
 
-        # Respawn KO'd objects (as per main.py's update logic)
-        for player_list in self.players_objects:
-            for obj in player_list:
-                if obj.hp <= 0:
-                    obj.respawn() # Respawn includes resetting has_moved_this_turn
+        surface.fill(LIGHT_GREY)  # Background color
 
-        player_who_just_moved = self.current_player_turn # Player whose action led to this state
-        
-        # Check if the player who just moved can make another move with a *different* unit
-        can_current_player_move_again = self.can_player_move(player_who_just_moved)
-        
-        # Check if the other player can move
-        other_player = 1 - player_who_just_moved
-        can_other_player_move = self.can_player_move(other_player)
-
-        if can_current_player_move_again:
-            # Current player continues if they have more units to move
-            # print(f"DEBUG: Player {player_who_just_moved+1} can move another unit.")
-            pass # Turn does not change
-        elif can_other_player_move:
-            # Switch to the other player
-            self.current_player_turn = other_player
-            # print(f"DEBUG: Player {player_who_just_moved+1} finished. Player {self.current_player_turn+1}'s turn.")
-        else:
-            # Neither player can move with their current set of "ready" units. This means a full round/exchange ends.
-            # print(f"DEBUG: All units moved for both players. Next round.")
-            for p_list_reset in self.players_objects:
-                for o_reset in p_list_reset:
-                    o_reset.has_moved_this_turn = False # Reset all units for new round
-            
-            # Switch starting player for the new round, like in main.py's next_round()
-            self.first_player_of_round = 1 - self.first_player_of_round
-            self.current_player_turn = self.first_player_of_round
-            # print(f"DEBUG: New round. Player {self.current_player_turn+1} starts.")
-
-
-    def all_objects_stopped(self) -> bool:
+        # Draw all game objects
         for player_objs in self.players_objects:
             for obj in player_objs:
-                if obj.is_moving:
-                    return False
-        return True
+                # GameObject.draw handles its own drawing logic, including for KO'd objects
+                obj.draw(surface, self.font_small, self.font_hp_atk)
 
-    def can_player_move(self, player_id: int) -> bool:
-        if player_id < 0 or player_id >= len(self.players_objects):
-            return False
-        for obj in self.players_objects[player_id]:
-            if obj.hp > 0 and not obj.has_moved_this_turn:
-                return True
-        return False
+        # Draw scores
+        score_text = f"P1 (Blue): {self.scores[0]}  |  P2 (Red): {self.scores[1]}"
+        score_surface = self.font.render(score_text, True, BLACK)
+        surface.blit(score_surface, (SCREEN_WIDTH // 2 - score_surface.get_width() // 2, 10))
 
-    # next_round from main.py was more for a full reset of has_moved_this_turn for everyone
-    # The turn progression logic is now mainly in _handle_turn_progression_after_action
-    # A simpler next_round might just reset has_moved for all and pick a starter if needed.
-    def next_round_full_reset(self): # Renamed to avoid conflict if used differently
-        # print("DEBUG: Advancing to next full round/exchange (all units can move again).")
-        for player_list in self.players_objects:
-            for obj in player_list:
-                obj.has_moved_this_turn = False
-        # self.current_player_turn = random.choice([0,1]) # main.py uses a more deterministic switch
-        self.first_player_of_round = 1 - self.first_player_of_round
-        self.current_player_turn = self.first_player_of_round
-
-
-    def draw(self): # Adapted from main.py's Game.draw
-        if self.headless_mode or not self.screen or not self.font:
-            return
-
-        self.screen.fill(LIGHT_GREY) # Use LIGHT_GREY like original env
-
-        for player_objs in self.players_objects:
-            for obj in player_objs:
-                if obj.hp > 0: # Only draw objects that are alive
-                    obj.draw(self.screen, self.font_small, self.font_hp_atk)
-
-        # Scores (same as main.py)
-        score_text_p0 = self.font.render(f"P0 (Blue): {self.scores[0]}", True, BLUE)
-        score_text_p1 = self.font.render(f"P1 (Red): {self.scores[1]}", True, RED)
-        self.screen.blit(score_text_p0, (10, 10))
-        self.screen.blit(score_text_p1, (SCREEN_WIDTH - score_text_p1.get_width() - 10, 10))
-
-        # Turn / Status
-        status_text_str = ""
-        if not self.game_over:
-            player_name = "P0 (Blue)" if self.current_player_turn == 0 else "P1 (Red)"
-            if self.action_processing_pending: # This flag is set by the env's step method
-                status_text_str = "Objects moving..."
-            elif self.can_player_move(self.current_player_turn):
-                status_text_str = f"{player_name}, select an object to launch." # More like main.py
-            else:
-                # This case implies the current player has moved all their units,
-                # but the turn might not have switched yet if the other player also can't move (leading to next_round)
-                other_player_name = "P1 (Red)" if self.current_player_turn == 0 else "P0 (Blue)"
-                status_text_str = f"{player_name} has no more units. Waiting for {other_player_name} or next round."
+        # Draw current player turn
+        turn_text = f"Turn: Player {self.current_player_turn + 1}"
+        turn_color = BLUE if self.current_player_turn == 0 else RED
+        turn_surface = self.font.render(turn_text, True, turn_color)
+        surface.blit(turn_surface, (SCREEN_WIDTH // 2 - turn_surface.get_width() // 2, 40))
         
-        status_color = BLUE if self.current_player_turn == 0 else RED
-        status_surf = self.font.render(status_text_str, True, status_color)
-        status_rect = status_surf.get_rect(center=(SCREEN_WIDTH // 2, 20))
-        self.screen.blit(status_surf, status_rect)
-
-        # Unit status (optional for env, good for human mode)
-        y_offset_for_status = 50; x_offset_p1 = 10; x_offset_p2_base = SCREEN_WIDTH - 150
-        if self.font_small and self.font_hp_atk: # Check if fonts are available
-            # Player 0 Units Status (like main.py)
-            p0_label_surf = self.font.render(f"P0 Units:", True, BLACK)
-            self.screen.blit(p0_label_surf, (x_offset_p1, y_offset_for_status))
-            current_y_p0 = y_offset_for_status + 20 # Adjusted spacing
-            for obj_idx, obj in enumerate(self.players_objects[0]):
-                status = "Moved" if obj.has_moved_this_turn else "Ready"
-                if obj.hp <=0: status = "KO"
-                obj_text = f"  Obj {obj_idx+1}: {status}" # Simplified, HP/ATK drawn on object
-                text_surface = self.font_small.render(obj_text, True, BLACK if obj.hp > 0 else GREY)
-                self.screen.blit(text_surface, (x_offset_p1, current_y_p0))
-                current_y_p0 += 15 # Adjusted spacing
-
-            # Player 1 Units Status (like main.py)
-            p1_label_text = f"P1 Units:"
-            # p1_label_size_x, _ = self.font.size(p1_label_text) # font.size is pygame specific
-            p1_label_surf = self.font.render(p1_label_text, True, BLACK)
-            # base_x_p1_units = SCREEN_WIDTH - p1_label_surf.get_width() - 10 # Align right
-            base_x_p1_units = x_offset_p2_base # Use existing offset
-            self.screen.blit(p1_label_surf, (base_x_p1_units, y_offset_for_status))
-            current_y_p1 = y_offset_for_status + 20 # Adjusted spacing
-            for obj_idx, obj in enumerate(self.players_objects[1]):
-                status = "Moved" if obj.has_moved_this_turn else "Ready"
-                if obj.hp <=0: status = "KO"
-                obj_text = f"  Obj {obj_idx+1}: {status}" # Simplified
-                text_surface = self.font_small.render(obj_text, True, BLACK if obj.hp > 0 else GREY)
-                self.screen.blit(text_surface, (base_x_p1_units, current_y_p1))
-                current_y_p1 += 15 # Adjusted spacing
+        # Draw "Can Move" indicator for current player
+        can_move = self.can_player_move(self.current_player_turn)
+        can_move_text = "Can Move" if can_move else "No Moves Left"
+        can_move_color = GREEN if can_move else GREY
+        can_move_surface = self.font.render(can_move_text, True, can_move_color)
+        surface.blit(can_move_surface, (SCREEN_WIDTH // 2 - can_move_surface.get_width() // 2, 70))
 
 
+        # Draw Game Over message if applicable
         if self.game_over:
-            winner_name = "P0 (Blue)" if self.winner == 0 else "P1 (Red)"
-            winner_color = BLUE if self.winner == 0 else RED
-            go_text_surf = self.font.render(f"Game Over! {winner_name} Wins!", True, winner_color, BLACK)
-            go_rect = go_text_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 20))
+            winner_text = ""
+            if self.winner is not None:
+                winner_text = f"Player {self.winner + 1} Wins!"
+            else: # Should not happen if game_over is True and MAX_VICTORY_POINTS logic is correct
+                winner_text = "Game Over - Draw?" 
             
-            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-            overlay.fill((128, 128, 128, 180))
-            self.screen.blit(overlay, (0,0))
-            self.screen.blit(go_text_surf, go_rect)
-        
-        # pygame.display.flip() is NOT called here; env.render() handles it.
+            game_over_message = f"GAME OVER! {winner_text}"
+            game_over_surface = self.font.render(game_over_message, True, GREEN if self.winner is not None else BLACK)
+            text_rect = game_over_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+            
+            # Simple background for game over text
+            bg_rect = text_rect.inflate(20, 20)
+            pygame.draw.rect(surface, LIGHT_GREY, bg_rect)
+            pygame.draw.rect(surface, BLACK, bg_rect, 2)
+            surface.blit(game_over_surface, text_rect)
 
-# --- RL Environment Constants (already defined in original env, ensure consistency) ---
-NUM_OBJECTS_PER_PLAYER = 3 
-NUM_PLAYERS = 2
-FEATURES_PER_OBJECT = 5 # x, y, hp, has_moved, is_alive
-TOTAL_OBJECT_FEATURES = NUM_OBJECTS_PER_PLAYER * NUM_PLAYERS * FEATURES_PER_OBJECT
-ADDITIONAL_FEATURES = 3 # current_player_id, p0_score, p1_score
-OBSERVATION_SPACE_SIZE = TOTAL_OBJECT_FEATURES + ADDITIONAL_FEATURES
-
-NUM_DIRECTIONS = 8
-NUM_STRENGTHS = 3
-# MAX_LAUNCH_STRENGTH_DX_DY was used for action mapping, ensure GameObject.apply_force and action decoding align.
-# The GameObject.apply_force now uses FORCE_MULTIPLIER internally.
-# The action decoding in env.step() needs to produce dx, dy for apply_force.
-# Let's assume the env's MAX_LAUNCH_STRENGTH_DX_DY was for the magnitude of the (dx,dy) vector passed to apply_force.
-# The apply_force in main.py takes dx,dy (mouse_pos - obj_pos) and scales by FORCE_MULTIPLIER.
-# So, the RL action should produce dx, dy that represent that vector.
-
+# --- SealSlammersEnv Class (Gym Environment) ---
 class SealSlammersEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': FPS}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, num_objects_per_player=3):
         super().__init__()
         self.render_mode = render_mode
-        # Game class now handles Pygame init based on headless flag
-        self.game = Game(headless=(render_mode != 'human'), num_objects_per_player=NUM_OBJECTS_PER_PLAYER)
-        self.game.reset_game_state() # Ensure clean state
+        # Pass headless=True if render_mode is not 'human' or 'rgb_array'.
+        # The Game class itself will handle pygame.init() and font.init()
+        # based on its own headless_mode.
+        self.game = Game(headless=(render_mode != "human" and render_mode != "rgb_array"), num_objects_per_player=num_objects_per_player)
+        
+        self.window_surface = None # Initialize for render() method
+        self.clock = None          # Initialize for render() method
+        # Fonts are managed within the Game class, so no need to duplicate here unless
+        # the environment itself needs to draw things outside the Game.draw() scope.
+
+        # Action space:
+        # action[0]: object_to_move (0 to num_objects_per_player - 1)
+        # action[1]: angle_idx (0 to 71 for 72 directions)
+        # action[2]: strength_idx (0 to 4 for 5 levels)
+        self.action_space = spaces.MultiDiscrete([
+            num_objects_per_player, # Which object to control
+            72,                     # Angle of launch (72 directions)
+            5                       # Strength of launch (5 levels)
+        ])
+
+        # Observation space (example, needs to be defined based on what the agent sees)
+        # For simplicity, let\'s define a flat Box space.
+        # Each object: x, y, vx, vy, hp, has_moved_this_turn (6 features)
+        # Total features = num_objects_per_player * 2 players * 6 features
+        # Plus: current_player_turn (1), P1_score (1), P2_score (1)
+        # Updated observation space:
+        # For each object (num_objects_per_player * 2):
+        #   x, y, vx, vy, hp (normalized), attack (normalized), original_x, original_y,
+        #   is_moving (0/1), has_moved_this_turn (0/1), player_id (0/1), object_id (0 to N-1)
+        #   (12 features per object)
+        # Global state: current_player_turn (0/1), p0_score, p1_score (normalized) (3 features)
+        # Total features = (num_objects_per_player * 2 * 12) + 3
+        # Max objects = 3 per player for now.
+        # (3 * 2 * 12) + 3 = 72 + 3 = 75 features.
+        # Let\'s use a simpler observation for now, closer to the original.
+        # Each object: x, y, vx, vy, hp, is_moving, has_moved_this_turn (7 features)
+        # Player scores: score_p0, score_p1 (2 features)
+        # Current player turn: (1 feature)
+        # Total: num_objects_per_player * 2 * 7 + 2 + 1
+        
+        # Simplified observation:
+        # For each object (num_objects_per_player * 2): x, y, vx, vy, hp, has_moved (6 features)
+        # Scores: p0_score, p1_score (2 features)
+        # Current player turn (1 feature)
+        # Total = (num_objects_per_player * 2 * 6) + 2 + 1
+        obs_dim = (num_objects_per_player * 2 * 6) + 2 + 1
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(OBSERVATION_SPACE_SIZE,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
-        self.action_space = spaces.MultiDiscrete([NUM_OBJECTS_PER_PLAYER, NUM_DIRECTIONS, NUM_STRENGTHS])
-        
-        self.current_reward = 0.0
-        self.prev_scores = list(self.game.scores)
-
-        # Fallback for human mode screen init if Game class didn't (should be handled by Game now)
-        if self.render_mode == 'human' and self.game.screen is None:
-            print("Warning: SealSlammersEnv.__init__: Human mode but game screen not initialized by Game. Re-attempting in Env.")
-            if not pygame.get_init(): pygame.init()
-            self.game.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-            pygame.display.set_caption("RL Seal Slammers (Env Fallback Init)")
-            if not pygame.font.get_init(): pygame.font.init()
-            self.game.font = pygame.font.SysFont(None, 30)
-            self.game.font_small = pygame.font.SysFont(None, 18)
-            self.game.clock = pygame.time.Clock()
-            self.game.headless_mode = False
-
-
-    def _get_obs(self):
-        obs = []
-        for player_idx in range(NUM_PLAYERS):
-            for obj_idx in range(NUM_OBJECTS_PER_PLAYER):
-                # Ensure object exists, e.g. if num_objects_per_player varies (though fixed here)
-                obj = self.game.players_objects[player_idx][obj_idx]
-                obs.extend([
-                    obj.x / SCREEN_WIDTH,
-                    obj.y / SCREEN_HEIGHT,
-                    obj.hp / INITIAL_HP if INITIAL_HP > 0 else 0.0,
-                    1.0 if obj.has_moved_this_turn else 0.0,
-                    1.0 if obj.hp > 0 else 0.0  # is_alive
-                ])
-        
-        obs.extend([
-            float(self.game.current_player_turn),
-            float(self.game.scores[0]), # P0 score
-            float(self.game.scores[1])  # P1 score
-        ])
-        return np.array(obs, dtype=np.float32)
-
-    def _get_info(self):
-        return {
-            "player_0_score": self.game.scores[0],
-            "player_1_score": self.game.scores[1],
-            "current_player_turn": self.game.current_player_turn,
-            "game_over": self.game.game_over,
-            "winner": self.game.winner,
-            "main_py_imported": False # Using internal logic
-        }
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        if seed is not None: # Seed random for reproducibility if game uses it (e.g. start player)
-            random.seed(seed)
-            np.random.seed(seed) # If using np.random anywhere for game logic
-
         self.game.reset_game_state()
-        self.prev_scores = list(self.game.scores)
-        self.current_reward = 0.0
-        
-        observation = self._get_obs()
-        info = self._get_info()
-
-        if self.render_mode == 'human':
+        if self.render_mode == "human":
             self.render()
-            
-        return observation, info
+        return self._get_obs(), self.get_info()
+
+    def _get_obs(self):
+        # Flattened state: all objects' states + current player turn + scores
+        # For each object: x, y, vx, vy, hp, is_moving, has_moved_this_turn (7 features)
+        # Scores: p0_score, p1_score (2 features)
+        # Current player turn (1 feature)
+        # Total = (num_objects_per_player * 2 * 7) + 2 + 1
+        state = []
+        for player_objs in self.game.players_objects:
+            for obj in player_objs:
+                if obj.hp > 0: # Only include alive objects
+                    state.extend([
+                        obj.x, obj.y, obj.vx, obj.vy, obj.hp,
+                        1.0 if obj.is_moving else 0.0, # is_moving as 1.0/0.0
+                        1.0 if obj.has_moved_this_turn else 0.0, # has_moved_this_turn as 1.0/0.0
+                    ])
+                else: # For KO'd objects, we might want to include their last known position/velocity for debugging or transitions
+                    state.extend([
+                        obj.x, obj.y, obj.vx, obj.vy, 0, # HP 0 for KO'd
+                        0.0, 0.0, # is_moving, has_moved_this_turn
+                    ])
+
+        # Current player turn (0 or 1)
+        state.append(float(self.game.current_player_turn))
+
+        # Scores (normalized or raw, depending on design)
+        # For simplicity, let's use raw scores directly.
+        state.extend(self.game.scores)
+
+        return np.array(state, dtype=np.float32)
+
+    def get_info(self):
+        # Info can include any additional debugging or tracking information
+        return {}
 
     def step(self, action):
-        obj_choice_idx, direction_idx, strength_idx = action
-        current_player_id = self.game.current_player_turn
-        player_objects = self.game.players_objects[current_player_id]
-        
+        object_idx, angle_idx, strength_idx = action
+
+        current_player_id = self.game.current_player_turn # Player whose turn it is to act
         selected_obj = None
-        if 0 <= obj_choice_idx < len(player_objects):
-            obj_candidate = player_objects[obj_choice_idx]
-            # Ensure the object is valid to be moved
-            if obj_candidate.hp > 0 and not obj_candidate.has_moved_this_turn:
-                 selected_obj = obj_candidate
         
-        self.current_reward = 0.0 # Reset reward for the step
+        # Check if the chosen object is valid (belongs to current player and is alive and hasn\'t moved)
+        if 0 <= object_idx < len(self.game.players_objects[current_player_id]):
+            candidate_obj = self.game.players_objects[current_player_id][object_idx]
+            if candidate_obj.hp > 0 and not candidate_obj.has_moved_this_turn: # Added check for has_moved_this_turn
+                selected_obj = candidate_obj
+        
+        initial_scores = list(self.game.scores) # Copy scores
 
         if selected_obj:
-            # Action is valid: an alive, unmoved object is selected
-            angle_rad = (direction_idx / NUM_DIRECTIONS) * 2 * math.pi # This is the LAUNCH direction
-            
-            strength_ratios = [0.33, 0.66, 1.0] # Low, Medium, High strength proportions
-            
-            # Calculate the magnitude of the pull vector based on main.py logic
-            # MAX_LAUNCH_STRENGTH is replaced by this calculation
-            _max_pull_pixels = MAX_PULL_RADIUS_MULTIPLIER * OBJECT_RADIUS
-            actual_pull_magnitude = _max_pull_pixels * strength_ratios[strength_idx]
+            pull_angle_rad = (angle_idx / 72.0) * 2 * math.pi  # Angle of the "pull" action (NOW 72 directions)
+            launch_angle_rad = pull_angle_rad + math.pi  # Launch is opposite to pull
 
-            # apply_force expects dx, dy to be the components of the pull vector (object_center to mouse_pos)
-            # The launch direction is angle_rad. The pull direction is opposite (angle_rad + pi).
-            dx_for_force = actual_pull_magnitude * math.cos(angle_rad + math.pi)
-            dy_for_force = actual_pull_magnitude * math.sin(angle_rad + math.pi)
-            
-            selected_obj.apply_force(dx_for_force, dy_for_force)
-            # GameObject.apply_force internally uses FORCE_MULTIPLIER
+            # ADDED: Set the object's angle based on the RL agent's chosen launch direction.
+            # This ensures the object faces the correct direction at the moment of launch by an agent.
+            # This angle will persist during movement due to the change in GameObject.move().
+            selected_obj.angle = launch_angle_rad
 
-            self.game.action_processing_pending = True # Mark that an action is being processed
+            strength_scale = (strength_idx + 1) / 5.0  # 0 to 4 -> 0.2 to 1.0
+            actual_strength_magnitude = strength_scale * MAX_LAUNCH_STRENGTH_RL # This is launch velocity magnitude
+
+            # launch_vx, launch_vy is the desired velocity of the object in the launch direction
+            launch_vx = math.cos(launch_angle_rad) * actual_strength_magnitude
+            launch_vy = math.sin(launch_angle_rad) * actual_strength_magnitude
+            
+            # GameObject.apply_force expects dx, dy to be "pull vector components"
+            # To achieve launch_vx, launch_vy, the effective "pull vector" (dx_param, dy_param)
+            # passed to apply_force should be such that:
+            # launch_vx = -dx_param * FORCE_MULTIPLIER  (since apply_force does self.vx = -dx * multiplier)
+            # launch_vy = -dy_param * FORCE_MULTIPLIER
+            # So, dx_param = -launch_vx / FORCE_MULTIPLIER
+            # and dy_param = -launch_vy / FORCE_MULTIPLIER
+            # These dx_param, dy_param will be in the original pull direction.
+            if FORCE_MULTIPLIER == 0: # Avoid division by zero
+                dx_to_pass_to_apply_force = 0
+                dy_to_pass_to_apply_force = 0
+            else:
+                dx_to_pass_to_apply_force = -launch_vx / FORCE_MULTIPLIER
+                dy_to_pass_to_apply_force = -launch_vy / FORCE_MULTIPLIER
+            
+            selected_obj.apply_force(dx_to_pass_to_apply_force, dy_to_pass_to_apply_force)
+            self.game.action_processing_pending = True
         else:
-            # Invalid action
-            self.current_reward -= 1.0 # Penalty for invalid action selection
-            self.game.action_processing_pending = False
+            # Invalid action (e.g., chose KO'd object or bad index)
+            # No game object moves, effectively a pass or lost turn.
+            # Physics simulation will run but likely nothing happens from player action.
+            self.game.action_processing_pending = True # Still need to run simulation loop once.
 
-        # --- Simulate Game ---
-        frames_simulated_this_step = 0
-        # MAX_FRAMES_PER_STEP = FPS * 3 # Simulate for max 3 seconds of game time per agent step
-        # Let's use a slightly shorter max sim time for faster steps if physics are slow
-        MAX_SIM_STEPS_PER_AGENT_STEP = FPS * 2 # e.g., 120 physics steps
 
-        # Store scores before simulation for this step's reward calculation
-        score_at_step_start_p0 = self.game.scores[0]
-        score_at_step_start_p1 = self.game.scores[1]
+        # Simulate game until objects stop moving or max steps for this turn
+        frames_this_step = 0
+        MAX_FRAMES_PER_ACTION_STEP = 300 # Max simulation frames per RL step
 
-        while frames_simulated_this_step < MAX_SIM_STEPS_PER_AGENT_STEP:
-            if self.game.game_over:
-                break
+        # Store the player ID who took this specific action, for damage attribution if needed.
+        # self.game.acting_player_this_step = current_player_id (Game class needs this attribute if used)
+        # For now, self.game.current_player_turn is assumed to be the one who initiated the action.
+
+        while self.game.action_processing_pending and frames_this_step < MAX_FRAMES_PER_ACTION_STEP:
+            still_active = self.game._simulate_frame_physics_and_damage()
+            if not still_active: # All objects stopped
+                self.game.action_processing_pending = False
             
-            self.game._simulate_frame_physics_and_damage() # This handles all physics, damage, scoring for one frame
-            self.game.frame_count += 1
-            frames_simulated_this_step += 1
-
-            if self.game.all_objects_stopped():
-                break 
+            frames_this_step += 1
+            
+            if self.render_mode == "human": # Render intermediate frames of the action
+                 self.render()
+            
+            if self.game.game_over: # If game ends mid-action simulation
+                break
         
-        # After physics simulation (either objects stopped or max sim steps reached)
-        if self.game.action_processing_pending and self.game.all_objects_stopped():
-            self.game._handle_turn_progression_after_action()
-            self.game.action_processing_pending = False # Ensure it's reset
+        self.game.action_processing_pending = False # Ensure it's false after loop
 
-        # --- Calculate Reward ---
-        agent_player_id = 0 # Assuming agent is always player 0
-        opponent_player_id = 1
+        terminated = self.game.game_over
+        
+        # Calculate reward (logic can be refined)
+        reward = 0.0
+        score_diff_p_current = self.game.scores[current_player_id] - initial_scores[current_player_id]
+        opponent_player_id = 1 - current_player_id
+        score_diff_p_opponent = self.game.scores[opponent_player_id] - initial_scores[opponent_player_id]
 
-        score_change_agent = self.game.scores[agent_player_id] - score_at_step_start_p0
-        score_change_opponent = self.game.scores[opponent_player_id] - score_at_step_start_p1
+        reward += score_diff_p_current * 100.0 
+        reward -= score_diff_p_opponent * 50.0 
 
-        self.current_reward += (score_change_agent * 1.0)
-        self.current_reward -= (score_change_opponent * 0.5) # Penalize opponent scoring, maybe less heavily
+        if not selected_obj: 
+            reward -= 10.0
 
-        if self.game.game_over:
-            if self.game.winner == agent_player_id:
-                self.current_reward += 10.0 # Win bonus
+        if terminated:
+            if self.game.winner == current_player_id:
+                reward += 500.0 
             elif self.game.winner == opponent_player_id:
-                self.current_reward -= 10.0 # Loss penalty
+                reward -= 500.0
+        
+        # Respawn KO'd objects before turn progression (if game not over)
+        if not terminated:
+            for player_list_idx, player_objs in enumerate(self.game.players_objects): # Use enumerate if idx needed
+                for obj_to_respawn in player_objs: # Iterate directly over objects
+                    if obj_to_respawn.hp <= 0:
+                        preferred_x = obj_to_respawn.original_x
+                        preferred_y = obj_to_respawn.original_y
+                        
+                        # Find a non-overlapping position using the Game class method
+                        final_x, final_y = self.game._find_non_overlapping_spawn_position(
+                            obj_to_respawn, preferred_x, preferred_y
+                        )
+                        obj_to_respawn.respawn(final_x, final_y) # Pass the found position
+            
+            # Turn progression logic (from main.py)
+            # current_player_id is the player who just took the action.
+            # self.game.current_player_turn might have changed if game.next_round() was called by game over.
+            # Re-evaluate based on current_player_id who just acted.
+            
+            # If game ended, self.game.current_player_turn might not be relevant for next action.
+            # The turn logic below assumes game is NOT terminated.
+            
+            player_who_just_moved = current_player_id 
+            # Check game status again in case respawn logic or other things change it (unlikely here)
+            if not self.game.game_over:
+                potential_next_player = 1 - player_who_just_moved
+                
+                can_potential_next_player_move = self.game.can_player_move(potential_next_player)
+                can_player_who_just_moved_still_move = self.game.can_player_move(player_who_just_moved)
+
+                if can_potential_next_player_move:
+                    self.game.current_player_turn = potential_next_player
+                    # print(f"DEBUG ENV: Turn switched to P{self.game.current_player_turn + 1}")
+                elif not can_player_who_just_moved_still_move: # Current player also cannot move
+                    # print("DEBUG ENV: Both players cannot move. Starting next round.")
+                    self.game.next_round() 
+                # Else: current player (player_who_just_moved) can still move,
+                # and potential_next_player cannot. So, current player continues.
+                # self.game.current_player_turn remains player_who_just_moved.
+                # print(f"DEBUG ENV: P{player_who_just_moved+1} continues turn or next round starts.")
         
         observation = self._get_obs()
-        terminated = self.game.game_over
-        # Truncated if max sim steps hit without game ending AND objects were still moving (or some other condition)
-        # For now, simple truncation if max sim steps hit and not terminated.
-        truncated = frames_simulated_this_step >= MAX_SIM_STEPS_PER_AGENT_STEP and not terminated 
-        
-        info = self._get_info()
+        info = self.get_info() # Corrected: self._get_info()
+        truncated = (frames_this_step >= MAX_FRAMES_PER_ACTION_STEP) and not terminated
 
-        if self.render_mode == 'human':
+        if self.render_mode == "human":
             self.render()
 
-        return observation, self.current_reward, terminated, truncated, info
+        return observation, reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode is None:
             gym.logger.warn("You are calling render method without specifying any render mode.")
-            return None # Return None if no rendering is done
+            return
 
-        if self.render_mode == 'human':
-            if self.game.screen is None or self.game.headless_mode:
-                # This should ideally be caught by __init__ or Game class init
-                print("Error: Human rendering mode but no screen or game is headless in render().")
-                return None
-            self.game.draw() # Game's draw method
+        if self.render_mode == "human":
+            if self.window_surface is None: # Initialize if not done (e.g. if render_mode changed)
+                if not pygame.get_init(): pygame.init()
+                if not pygame.font.get_init(): pygame.font.init()
+                self.window_surface = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                pygame.display.set_caption("Seal Slammers RL Environment")
+                self.clock = pygame.time.Clock()
+                self.game.screen = self.window_surface # Ensure game uses this screen
+                self.game.headless_mode = False
+
+            self.game.draw_game_state(self.window_surface) # Game class handles drawing its elements
             pygame.display.flip()
-            if self.game.clock:
-                self.game.clock.tick(self.metadata['render_fps'])
-            return None # Human mode doesn't return an array
+            if self.clock: self.clock.tick(self.metadata['render_fps'])
+            return True
+        
+        elif self.render_mode == "rgb_array":
+            # Create a temporary surface for rgb_array rendering if game is headless
+            # or if we want a consistent rendering path for rgb_array
+            temp_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            
+            # Store original game screen settings
+            original_game_screen = self.game.screen
+            original_headless_mode = self.game.headless_mode
 
-        elif self.render_mode == 'rgb_array':
-            if self.game.headless_mode and self.game.screen is None:
-                # Need a surface to draw on for rgb_array if game is truly headless
-                # Create a temporary surface. Game.draw should use self.screen.
-                temp_screen_for_rgb = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-                original_game_screen = self.game.screen # Store original (likely None)
-                self.game.screen = temp_screen_for_rgb # Temporarily assign
-                
-                self.game.draw() # Draw onto the temp surface
-                
-                rgb_array = pygame.surfarray.array3d(temp_screen_for_rgb)
-                self.game.screen = original_game_screen # Restore original
-                return np.transpose(rgb_array, (1, 0, 2)) # Pygame is (width, height)
-            elif self.game.screen is not None: # If game has a screen (e.g. was human, or Game init created one)
-                self.game.draw()
-                rgb_array = pygame.surfarray.array3d(self.game.screen)
-                return np.transpose(rgb_array, (1, 0, 2))
-            else:
-                gym.logger.error("RGB array rendering failed: no screen available.")
-                return None
+            self.game.screen = temp_surface
+            self.game.headless_mode = False # Ensure drawing happens
+            if not self.game.font: # Ensure fonts are loaded if game was purely headless
+                if not pygame.font.get_init(): pygame.font.init()
+                self.game.font = pygame.font.SysFont(None, 30)
+                self.game.font_small = pygame.font.SysFont(None, 18)
+                self.game.font_hp_atk = pygame.font.SysFont(None, 18)
+
+            self.game.draw_game_state(temp_surface)
+            
+            rgb_array = pygame.surfarray.array3d(temp_surface)
+            
+            # Restore original game screen settings
+            self.game.screen = original_game_screen
+            self.game.headless_mode = original_headless_mode
+            
+            return np.transpose(rgb_array, (1, 0, 2)) # Convert (width, height, C) to (height, width, C) for gym convention
+        
         return None
 
 
     def close(self):
-        # Pygame quit is handled globally, so only call if it was initialized.
-        if pygame.get_init():
+        if self.window_surface is not None:
             pygame.display.quit()
-            pygame.quit()
-        # print("SealSlammersEnv closed.")
+            self.window_surface = None
+        # Pygame quit should ideally be called when the application is fully closing,
+        # not necessarily when one env instance is closed, if other pygame stuff is running.
+        # However, if this env is the main user of pygame display, it's fine.
+        # For safety, let's assume we only quit display here.
+        # If pygame.get_init() and no other modules depend on it, pygame.quit() could be called.
+        # pygame.quit() # This uninitializes all pygame modules.
+        pass # Avoid global pygame.quit() for now.
 
-# --- Main test block (from original env, slightly adapted) ---
-if __name__ == '__main__':
-    print("Testing SealSlammersEnv with internal game logic...")
-    
-    # Test with human rendering
-    env_human = SealSlammersEnv(render_mode='human')
-    obs, info = env_human.reset(seed=42) # Added seed for reproducibility
-    print(f"Human Mode: Reset successful. Import status: {info.get('main_py_imported', 'N/A')}")
-    print("Initial observation shape:", obs.shape)
-    # print("Initial info:", info)
-    
-    for i in range(20): # Run more steps for testing
-        action = env_human.action_space.sample()
-        print(f"Step {i+1}, Action: {action}")
-        obs, reward, terminated, truncated, info = env_human.step(action)
-        print(f"Obs shape: {obs.shape[-1]}, Reward: {reward:.2f}, Term: {terminated}, Trunc: {truncated}, P0 Score: {info['player_0_score']}, P1 Score: {info['player_1_score']}")
-        if terminated or truncated:
-            print(f"Episode finished after {i+1} steps. Winner: {info.get('winner')}")
-            obs, info = env_human.reset(seed=i+43) # New seed for next episode
-    env_human.close()
-    print("Human mode test finished.")
-
-    # Test with rgb_array rendering
-    print("\nTesting RGB Array Mode...")
-    env_rgb = SealSlammersEnv(render_mode='rgb_array')
-    obs, info = env_rgb.reset(seed=123)
-    print(f"RGB Array Mode: Reset successful.")
-    # print("Initial observation shape:", obs.shape)
-    rgb_frame = env_rgb.render()
-    if rgb_frame is not None:
-        print("Rendered RGB frame shape:", rgb_frame.shape)
-    else:
-        print("Failed to render RGB frame in test.")
-    
-    for _ in range(5):
-        action = env_rgb.action_space.sample()
-        obs, reward, terminated, truncated, info = env_rgb.step(action)
-        # print(f"RGB Step - Obs shape: {obs.shape[-1]}, Reward: {reward:.2f}, Term: {terminated}, Trunc: {truncated}")
-        if terminated or truncated: break
-    rgb_frame = env_rgb.render() # Render after a few steps
-    if rgb_frame is not None: print("Final RGB frame shape:", rgb_frame.shape)
-
-    env_rgb.close()
-    print("RGB Array mode test finished.")
-    
-    print("\nReview the copied logic from main.py carefully, especially within")
-    print("Game._simulate_frame_physics_and_damage() and Game._handle_turn_progression_after_action().")
+# Example of how to register (optional, can be done elsewhere)
+# from gymnasium.envs.registration import register
+# register(
+#     id='SealSlammers-v0',
+#     entry_point='__main__:SealSlammersEnv', # Or path to this file:module
+#     max_episode_steps=2000, # Max steps per episode if not handled by termination
+# )
