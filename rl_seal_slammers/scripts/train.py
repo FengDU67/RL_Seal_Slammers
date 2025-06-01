@@ -1,12 +1,11 @@
 import os
 import sys
 import torch  # Added import
-from stable_baselines3 import PPO
-from stable_baselines3.ppo.policies import MlpPolicy # CHANGED POLICY IMPORT
+from sb3_contrib import MaskablePPO 
 from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.env_util import make_vec_env  # Changed import
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv # SubprocVecEnv 用于并行化
 
 # --- Project Root and Path Setup ---
 # Assuming the script is in RL_Seal_Slammers/rl_seal_slammers/scripts/
@@ -21,21 +20,25 @@ from rl_seal_slammers.envs.seal_slammers_env import SealSlammersEnv
 
 # --- Parameters ---
 NUM_OBJECTS_PER_PLAYER = 3
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "sb3_ppo_sealslammers_mlp") # CHANGED
-MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "sb3_ppo_sealslammers_mlp") # CHANGED
-MODEL_SAVE_NAME = "ppo_sealslammers_mlp_model" # CHANGED
+TOTAL_TIMESTEPS = 1_000_000  # 示例：增加训练步数
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "sb3_maskable_ppo_sealslammers_mlp")
+MODEL_SAVE_DIR = os.path.join(PROJECT_ROOT, "models", "sb3_maskable_ppo_sealslammers_mlp")
+MODEL_NAME_PREFIX = "maskable_ppo_sealslammers_mlp_model"
+EVAL_FREQ = 25000  # 每隔多少步评估一次
+N_EVAL_EPISODES = 5 # 评估时运行多少个 episode
+BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_best")
 
-TOTAL_TIMESTEPS = 500000  # Total training timesteps
-N_ENVS = 16                 # Number of parallel environments
-MODEL_SAVE_FREQ = 50000    # Save a checkpoint every N total steps
+# 并行环境数量 (如果使用 SubprocVecEnv)
+N_ENVS = 16 # 示例：使用4个并行环境，可以根据您的CPU核心数调整
 
 os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+os.makedirs(BEST_MODEL_SAVE_PATH, exist_ok=True)
 
 def train_agent():
     print(f"Project Root: {PROJECT_ROOT}")
     print(f"Log Directory: {LOG_DIR}")
-    print(f"Model Directory: {MODEL_DIR}")
+    print(f"Model Directory: {MODEL_SAVE_DIR}")
 
     # Determine device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,61 +56,83 @@ def train_agent():
     env_kwargs = {'num_objects_per_player': NUM_OBJECTS_PER_PLAYER}
     # For MlpPolicy, make_vec_env will use SubprocVecEnv by default if n_envs > 1
     # and DummyVecEnv if n_envs = 1.
-    env = make_vec_env(SealSlammersEnv, n_envs=N_ENVS, env_kwargs=env_kwargs) # Removed vec_env_cls override
-    print("Vectorized environment created.")
+    env_fns = [lambda: Monitor(SealSlammersEnv(render_mode=None)) for _ in range(N_ENVS)]
+    env = SubprocVecEnv(env_fns)
+    print(f"Using {N_ENVS} parallel environments.")
 
     print("Initializing PPO agent with MlpPolicy...") # CHANGED MESSAGE
-    # policy_kwargs for MlpPolicy (if needed, e.g., for net_arch)
-    # For default MlpPolicy architecture, policy_kwargs can be None or an empty dict.
-    # Example: policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
-    # Removing LSTM-specific kwargs
     policy_kwargs = {} # Or None. Using {} for now.
 
-    model = PPO(
-        MlpPolicy,  # CHANGED POLICY CLASS
+    model = MaskablePPO(
+        "MlpPolicy",
         env,
+        learning_rate=3e-4,       # 示例值
+        n_steps=512 // N_ENVS,   # 每个并行环境的步数，总步数 n_steps * N_ENVS
+        batch_size=64,            # 示例值
+        n_epochs=10,              # 示例值
+        gamma=0.99,               # 示例值
+        gae_lambda=0.95,          # 示例值
+        ent_coef=0.01,            # 示例值，可以调整以平衡探索和利用
+        vf_coef=0.5,              # 示例值
+        max_grad_norm=0.5,        # 示例值
         verbose=1,
-        tensorboard_log=LOG_DIR,
-        policy_kwargs=policy_kwargs, # UPDATED policy_kwargs
-        n_steps=512,         # CHANGED: Number of steps to run for each environment per update
-        batch_size=64,       
-        n_epochs=10,         
-        gamma=0.99,          
-        gae_lambda=0.95,     
-        clip_range=0.2,      
-        ent_coef=0.0,        
-        vf_coef=0.5,         
-        max_grad_norm=0.5,   
-        learning_rate=3e-4,  
-        device=device,       
-        # seed=42,           
+        tensorboard_log=LOG_DIR
+    )
+    print("MaskablePPO model created.")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
+
+    # --- Callbacks ---
+    # 评估回调，用于在训练过程中定期评估模型并保存最佳模型
+    # Ensure eval_env is also a VecEnv, and preferably of the same type as the training env.
+    # The training env is SubprocVecEnv.
+    print("Creating evaluation environment...")
+    eval_env_fns = [lambda: Monitor(SealSlammersEnv(num_objects_per_player=NUM_OBJECTS_PER_PLAYER, render_mode=None))]
+    eval_env = SubprocVecEnv(eval_env_fns) # Use SubprocVecEnv for eval_env as well
+    print(f"Evaluation environment type: {type(eval_env)}")
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=BEST_MODEL_SAVE_PATH,
+        log_path=LOG_DIR,
+        eval_freq=max(EVAL_FREQ // N_ENVS, 1), # 调整评估频率以适应并行环境
+        n_eval_episodes=N_EVAL_EPISODES,
+        deterministic=True,
+        render=False
     )
 
-    # Setup a callback to save the model periodically
-    checkpoint_callback = CheckpointCallback(
-        save_freq=MODEL_SAVE_FREQ, # Save based on total timesteps
-        save_path=MODEL_DIR,
-        name_prefix=MODEL_SAVE_NAME
-    )
+    # 可选：如果达到某个奖励阈值就停止训练的回调
+    # reward_threshold = 200 # 示例阈值
+    # stop_training_callback = StopTrainingOnRewardThreshold(reward_threshold=reward_threshold, verbose=1)
+    # combined_callback = [eval_callback, stop_training_callback]
 
-    print("Starting training...")
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=checkpoint_callback,
-        log_interval=1, # Log training info every N rollouts (N = N_ENVS * n_steps timesteps)
-        # reset_num_timesteps=False # Set to False if you want to continue training from a loaded model
-    )
+    # --- Training ---
+    print(f"Starting training for {TOTAL_TIMESTEPS} timesteps...")
+    try:
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=eval_callback, # 或者 combined_callback
+            progress_bar=True
+        )
+    except Exception as e:
+        print(f"An error occurred during training: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # --- Save Final Model ---
+        final_model_path = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_final.zip")
+        model.save(final_model_path)
+        print(f"Final model saved to {final_model_path}")
+        print(f"Best model saved to {BEST_MODEL_SAVE_PATH}")
+        print(f"Tensorboard logs available at: {LOG_DIR}")
 
-    # Save the final model
-    final_model_path = os.path.join(MODEL_DIR, f"{MODEL_SAVE_NAME}_final")
-    model.save(final_model_path)
-    print(f"Training finished. Final model saved to {final_model_path}.zip")
-
-    env.close()
+    env.close() # 关闭环境
     print("Training script finished.")
 
 if __name__ == "__main__":
-    # To run this script:
-    # 1. Navigate to the project root directory: cd /home/wlq/PycharmProjects/RL_Seal_Slammers
-    # 2. Execute: python rl_seal_slammers/scripts/train.py
+    # 可选：检查环境是否符合 Gym API (主要用于调试环境)
+    # print("Checking custom environment...")
+    # check_env(SealSlammersEnv(render_mode=None)) 
+    # print("Environment check passed.")
+    
     train_agent()

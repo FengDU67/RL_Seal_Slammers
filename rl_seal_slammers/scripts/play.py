@@ -330,6 +330,7 @@ def get_random_ai_action(env, player_id): # Renamed from get_ai_action
 
 def play_game(mode, num_objects=3, model_path=None,
               p0_hp=None, p0_atk=None, p1_hp=None, p1_atk=None): # Added HP/ATK params
+    print(f"[DEBUG play_game] Initializing game with mode: {mode}, num_objects: {num_objects}, model_path: {model_path}, p0_hp: {p0_hp}, p0_atk: {p0_atk}, p1_hp: {p1_hp}, p1_atk: {p1_atk}") # DEBUG
     render_mode = 'human' if mode != 'ai_vs_ai_fast' else 'rgb_array'
     
     env_kwargs = {
@@ -364,8 +365,11 @@ def play_game(mode, num_objects=3, model_path=None,
             print(f"Model path not found: {model_path}. Falling back to random AI.")
 
     obs, info = env.reset()
+    print(f"[DEBUG play_game] env.reset() called. Initial obs shape: {obs.shape if isinstance(obs, np.ndarray) else type(obs)}, info: {info}") # DEBUG
+    print(f"[DEBUG play_game] Initial game.current_player_turn from env after reset: {env.game.current_player_turn}") # DEBUG
     terminated = False
     truncated = False
+    print(f"Initial observation received. Game reset. Current player: {env.game.current_player_turn + 1}")
 
     player_types = []
     if mode == 'human_vs_human':
@@ -378,9 +382,11 @@ def play_game(mode, num_objects=3, model_path=None,
         player_types = ['ai', 'ai']
     else:
         raise ValueError(f"Unknown game mode: {mode}")
+    print(f"[DEBUG play_game] Player types set to: P0='{player_types[0]}', P1='{player_types[1]}'") # DEBUG
 
     running = True
     while running:
+        print(f"\\n[DEBUG play_game] START OF TURN. env.game.current_player_turn: {env.game.current_player_turn}") # DEBUG
         if env.render_mode == 'human':
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -391,6 +397,7 @@ def play_game(mode, num_objects=3, model_path=None,
         
         current_player_id = env.game.current_player_turn
         player_type = player_types[current_player_id]
+        print(f"[DEBUG play_game] Determined current_player_id: {current_player_id} ({player_type})") # DEBUG
 
         action = None
         # Check if the current player can actually move before soliciting action
@@ -422,8 +429,11 @@ def play_game(mode, num_objects=3, model_path=None,
         if action is None: 
             print("Error: No action decided. Using random action.")
             action = env.action_space.sample().tolist()
-        obs, reward, terminated, truncated, info = env.step(action)
         
+        print(f"[DEBUG play_game] PRE-STEP: Applying action for player {current_player_id+1} ({player_type}). Action: {action}") # DEBUG
+        obs, reward, terminated, truncated, info = env.step(action)
+        print(f"[DEBUG play_game] POST-STEP: Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}, Info: {info}") # DEBUG
+      
         if env.render_mode == 'human' or (mode == 'ai_vs_ai_fast' and (terminated or truncated)): # Render last frame for fast mode
             env.render()
 

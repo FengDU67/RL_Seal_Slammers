@@ -73,21 +73,12 @@ class GameObject:
         self.last_damaged_frame = - DAMAGE_COOLDOWN_FRAMES * 2 # Initialize to allow immediate damage
         self.damage_intake_cooldown_frames = DAMAGE_COOLDOWN_FRAMES
         
-        # Attributes for drawing/UI from original env, might not be strictly needed for RL state if not drawing complexly
-        # self.line_length = 0.0
-        # self.line_thickness = 2
-        # self.line_color = GREY
 
     def apply_force(self, dx, dy, strength_multiplier=FORCE_MULTIPLIER):
-        # In main.py, dx, dy are from object to mouse (vector for launch)
-        # The RL env's step() method calculates dx, dy based on angle and strength.
-        # This method should directly use them to set velocity.
-        # The strength_multiplier is now a constant updated from main.py's effective value.
         self.vx = -dx * strength_multiplier 
         self.vy = -dy * strength_multiplier
         self.is_moving = True
         self.has_moved_this_turn = True # Consistent with main.py
-        # print(f"DEBUG: P{self.player_id+1}-Obj{self.object_id} force applied: vx={self.vx:.1f}, vy={self.vy:.1f}")
 
     def move(self):
         if self.is_moving:
@@ -97,12 +88,6 @@ class GameObject:
             self.vx *= FRICTION 
             self.vy *= FRICTION
             
-            # REMOVED: Logic to update angle based on velocity vector.
-            # The object's angle will now persist after launch,
-            # instead of aligning with the velocity vector during movement.
-            # if self.vx != 0 or self.vy != 0: # Only update angle if moving
-            #     self.angle = math.atan2(self.vy, self.vx) # Angle faces direction of movement
-
             if math.hypot(self.vx, self.vy) < MIN_SPEED_THRESHOLD:
                 self.vx = 0
                 self.vy = 0
@@ -656,11 +641,67 @@ class SealSlammersEnv(gym.Env):
 
         # --- Observation Construction ---
         observation = self._get_obs()
-        return observation, self.get_info()
+        # 在 reset 方法中调用 get_info() 以确保初始状态也包含动作掩码
+        info = self.get_info() 
+        
+        if self.render_mode == "human":
+            self.render()
+        return observation, info
 
     def get_info(self):
-        # Info can include any additional debugging or tracking information
-        return {}
+        try:
+            current_player_id = self.game.current_player_turn # 当前轮到行动的玩家
+
+            # 1. 创建对象选择掩码 (object_mask)
+            # 初始化为所有对象都不可选
+            object_mask_list = [False] * self.num_objects_per_player
+            
+            # 只有当当前玩家有棋子可以移动时，才计算有效的对象掩码
+            if self.game.can_player_move(current_player_id):
+                player_objects = self.game.players_objects[current_player_id]
+                for i, obj in enumerate(player_objects):
+                    # 对象可选的条件是：存活(hp > 0) 且 本回合尚未移动
+                    if obj.hp > 0 and not self.game.object_has_moved_this_turn(current_player_id, i):
+                        object_mask_list[i] = True
+            
+            object_mask_np = np.array(object_mask_list, dtype=bool)
+
+            # 2. 创建角度掩码 (angle_mask) - 通常所有角度都可选
+            # self.action_space.nvec[1] 对应的是动作空间中角度的数量 (例如 72)
+            angle_mask_np = np.full(self.action_space.nvec[1], True, dtype=bool)
+
+            # 3. 创建力度掩码 (strength_mask) - 通常所有力度都可选
+            # self.action_space.nvec[2] 对应的是动作空间中力度的数量 (例如 5)
+            strength_mask_np = np.full(self.action_space.nvec[2], True, dtype=bool)
+            
+            # 将三个掩码组合成一个元组
+            action_masks_tuple = (object_mask_np, angle_mask_np, strength_mask_np)
+
+            # 返回包含动作掩码和其他调试信息的字典
+            # MaskablePPO 会查找 "action_mask" 这个键
+            return {
+                "action_mask": action_masks_tuple,
+                "scores": [self.game.scores[0], self.game.scores[1]], # 包含当前分数
+                "winner": self.game.winner if hasattr(self.game, 'winner') else None, # 包含胜利者信息
+                # 您可以根据需要添加其他调试信息
+                # "can_player_move": self.game.can_player_move(current_player_id),
+                # "current_player_turn_in_info": current_player_id
+            }
+        except Exception as e:
+            print(f"ERROR IN SealSlammersEnv.get_info(): {e}")
+            import traceback
+            traceback.print_exc()
+            # 在出错时返回一个默认的、结构正确的掩码，以便让检查通过（但训练会是错误的）
+            # 这主要是为了暴露 get_info 内部的错误
+            default_object_mask = np.full(self.num_objects_per_player, True, dtype=bool)
+            default_angle_mask = np.full(self.action_space.nvec[1], True, dtype=bool)
+            default_strength_mask = np.full(self.action_space.nvec[2], True, dtype=bool)
+            return {
+                "action_mask": (default_object_mask, default_angle_mask, default_strength_mask),
+                "scores": [0, 0], # Default scores
+                "winner": None,
+                "error_in_get_info": str(e) # 标记错误发生
+            }
 
     def _calculate_reward(self, initial_scores, initial_hp_states, selected_obj, terminated, current_player_id):
         """
@@ -732,7 +773,7 @@ class SealSlammersEnv(gym.Env):
                not any_damage_dealt_to_opponent:
                 self.consecutive_meaningless_actions += 1
                 # Base penalty + progressive penalty
-                reward -= (10.0 + (self.consecutive_meaningless_actions -1) * 5.0) 
+                reward -= (10.0 + (self.consecutive_meaningless_actions -1) * 10.0) 
             else:
                 # If the action was meaningful, reset the counter
                 self.consecutive_meaningless_actions = 0
@@ -774,7 +815,7 @@ class SealSlammersEnv(gym.Env):
                 reward -= 500.0
         else:
             # --- Time-based penalty (if game not terminated) ---
-            reward -= 0.1 # Small penalty per step to encourage faster wins
+            reward -= 0.5 # Small penalty per step to encourage faster wins
 
         return reward
 
@@ -784,9 +825,16 @@ class SealSlammersEnv(gym.Env):
         
         object_idx, angle_idx, strength_idx = action
         current_player_id = self.game.current_player_turn
-        selected_obj = None
+
+        # ADDED: Check if the agent is attempting to select an object that has already moved this turn.
+        attempted_to_select_moved_object = False
+        if 0 <= object_idx < len(self.game.players_objects[current_player_id]):
+            candidate_obj_for_check = self.game.players_objects[current_player_id][object_idx]
+            if candidate_obj_for_check.hp > 0 and candidate_obj_for_check.has_moved_this_turn:
+                attempted_to_select_moved_object = True
         
-        # Check if the chosen object is valid (belongs to current player and is alive and hasn\'t moved)
+        selected_obj = None
+        # Check if the chosen object is valid (belongs to current player and is alive and hasn't moved)
         if 0 <= object_idx < len(self.game.players_objects[current_player_id]):
             candidate_obj = self.game.players_objects[current_player_id][object_idx]
             if candidate_obj.hp > 0 and not candidate_obj.has_moved_this_turn: # Added check for has_moved_this_turn
@@ -870,6 +918,11 @@ class SealSlammersEnv(gym.Env):
         # Calculate reward using the new dedicated function
         reward = self._calculate_reward(initial_scores, initial_hp_states, selected_obj, terminated, current_player_id)
         
+        # ADDED: Apply the specific, additional penalty if an already moved object was selected.
+        # This stacks on top of the -1000 penalty from _calculate_reward (because selected_obj would be None).
+        if attempted_to_select_moved_object:
+            reward -= 250.0  # Example value for the explicit, independent penalty. Tune as needed.
+            
         # Respawn KO\'d objects before turn progression (if game not over)
         if not terminated:
             for player_list_idx, player_objs in enumerate(self.game.players_objects): # Use enumerate if idx needed
@@ -918,7 +971,8 @@ class SealSlammersEnv(gym.Env):
         self.last_opponent_action = action_taken_by_current_player
         
         observation = self._get_obs()
-        info = self.get_info() # Corrected: self._get_info()
+        # 在 step 方法中调用 get_info() 以获取新状态的动作掩码
+        info = self.get_info() 
         truncated = (frames_this_step >= MAX_FRAMES_PER_ACTION_STEP) and not terminated
 
         if self.render_mode == "human":
