@@ -559,14 +559,14 @@ class SealSlammersEnv(gym.Env):
         self.last_opponent_action = [-1.0, -1.0, -1.0] 
         self.consecutive_meaningless_actions = 0
 
-        # Action space:
+        # Action space: 减少动作空间复杂度
         # action[0]: object_to_move (0 to num_objects_per_player - 1)
-        # action[1]: angle_idx (0 to 71 for 72 directions)
-        # action[2]: strength_idx (0 to 4 for 5 levels)
+        # action[1]: angle_idx (0 to 35 for 36 directions) - 减少到36个方向
+        # action[2]: strength_idx (0 to 2 for 3 levels) - 减少到3个力度等级
         self.action_space = spaces.MultiDiscrete([
             num_objects_per_player, 
-            72,                     
-            5                       
+            36,                     # 从72减少到36
+            3                       # 从5减少到3
         ])
 
         # Observation space:
@@ -594,30 +594,50 @@ class SealSlammersEnv(gym.Env):
         # REMOVED return statement from __init__
 
     def _get_obs(self):
-        # Flattened state: all objects\' states + current player turn + scores
-        # For each object: x, y, hp, attack, has_moved (5 features) - ALL RAW VALUES
-        # Global: current_player_turn (1), score_p0 (1), score_p1 (1) - ALL RAW VALUES
-        # Last opponent action: object index, angle index, strength index (3 features) - ALL RAW VALUES
+        # 改进的状态表示：使用相对位置和归一化特征
         state = []
         
+        # 获取当前玩家的对象作为参考点
+        current_player_objects = self.game.players_objects[self.game.current_player_turn]
+        opponent_objects = self.game.players_objects[1 - self.game.current_player_turn]
+        
+        # 计算当前玩家对象的中心位置作为参考点
+        current_alive_objects = [obj for obj in current_player_objects if obj.hp > 0]
+        if current_alive_objects:
+            center_x = sum(obj.x for obj in current_alive_objects) / len(current_alive_objects)
+            center_y = sum(obj.y for obj in current_alive_objects) / len(current_alive_objects)
+        else:
+            center_x, center_y = SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2
+        
+        # 为每个对象编码特征
         for player_objs in self.game.players_objects:
             for obj in player_objs:
-                state.extend([
-                    obj.x,
-                    obj.y,
-                    obj.hp,
-                    obj.attack,
-                    1.0 if obj.has_moved_this_turn else 0.0,
-                ])
+                # 相对位置 (归一化到 [-1, 1])
+                rel_x = (obj.x - center_x) / (SCREEN_WIDTH / 2)
+                rel_y = (obj.y - center_y) / (SCREEN_HEIGHT / 2)
+                
+                # 归一化HP和攻击力
+                norm_hp = obj.hp / 100.0  # 假设最大HP约为100
+                norm_attack = obj.attack / 20.0  # 假设最大攻击力约为20
+                
+                # 移动状态
+                has_moved = 1.0 if obj.has_moved_this_turn else 0.0
+                
+                state.extend([rel_x, rel_y, norm_hp, norm_attack, has_moved])
 
-        # Current player turn (0 or 1)
+        # 当前玩家回合
         state.append(float(self.game.current_player_turn))
 
-        # Raw Scores
-        state.extend([float(s) for s in self.game.scores]) # Ensure scores are float
+        # 归一化分数
+        state.extend([self.game.scores[0] / 10.0, self.game.scores[1] / 10.0])
 
-        # Add the last opponent's action to the observation
-        state.extend([float(a) for a in self.last_opponent_action])
+        # 上一个对手动作 (归一化)
+        norm_last_action = [
+            self.last_opponent_action[0] / self.num_objects_per_player,  # 对象索引
+            self.last_opponent_action[1] / 36.0,  # 角度索引 (更新为36)
+            self.last_opponent_action[2] / 3.0    # 力度索引 (更新为3)
+        ]
+        state.extend(norm_last_action)
 
         return np.array(state, dtype=np.float32)
 
@@ -638,6 +658,7 @@ class SealSlammersEnv(gym.Env):
                                   p1_hp=p1_hp, p1_atk=p1_atk)
         
         self.consecutive_meaningless_actions = 0 # Reset counter
+        self.last_opponent_action = [-1.0, -1.0, -1.0] # Reset opponent action
 
         # --- Observation Construction ---
         observation = self._get_obs()
@@ -648,12 +669,15 @@ class SealSlammersEnv(gym.Env):
             self.render()
         return observation, info
 
-    def get_info(self):
+    def action_masks(self):
+        """
+        Required method for MaskablePPO. Returns action masks for the current state.
+        For MultiDiscrete action spaces, this needs to return concatenated masks for each sub-action.
+        """
         try:
             current_player_id = self.game.current_player_turn # 当前轮到行动的玩家
 
             # 1. 创建对象选择掩码 (object_mask)
-            # 初始化为所有对象都不可选
             object_mask_list = [False] * self.num_objects_per_player
             
             # 只有当当前玩家有棋子可以移动时，才计算有效的对象掩码
@@ -664,23 +688,39 @@ class SealSlammersEnv(gym.Env):
                     if obj.hp > 0 and not self.game.object_has_moved_this_turn(current_player_id, i):
                         object_mask_list[i] = True
             
-            object_mask_np = np.array(object_mask_list, dtype=bool)
+            object_mask = np.array(object_mask_list, dtype=bool)
 
-            # 2. 创建角度掩码 (angle_mask) - 通常所有角度都可选
-            # self.action_space.nvec[1] 对应的是动作空间中角度的数量 (例如 72)
-            angle_mask_np = np.full(self.action_space.nvec[1], True, dtype=bool)
+            # 2. 创建角度掩码 - 如果有有效对象，则所有角度都可选
+            angle_mask = np.full(self.action_space.nvec[1], any(object_mask_list), dtype=bool)
 
-            # 3. 创建力度掩码 (strength_mask) - 通常所有力度都可选
-            # self.action_space.nvec[2] 对应的是动作空间中力度的数量 (例如 5)
-            strength_mask_np = np.full(self.action_space.nvec[2], True, dtype=bool)
+            # 3. 创建力度掩码 - 如果有有效对象，则所有力度都可选  
+            strength_mask = np.full(self.action_space.nvec[2], any(object_mask_list), dtype=bool)
             
-            # 将三个掩码组合成一个元组
-            action_masks_tuple = (object_mask_np, angle_mask_np, strength_mask_np)
+            # 对于MultiDiscrete，掩码应该是各个子动作空间掩码的连接
+            # 总长度 = sum(nvec) = 3 + 36 + 3 = 42
+            concatenated_mask = np.concatenate([object_mask, angle_mask, strength_mask])
+            
+            return concatenated_mask
+            
+        except Exception as e:
+            print(f"ERROR IN SealSlammersEnv.action_masks(): {e}")
+            import traceback
+            traceback.print_exc()
+            # 在出错时返回一个默认的、结构正确的掩码
+            total_mask_size = sum(self.action_space.nvec)
+            return np.ones(total_mask_size, dtype=bool)
+
+    def get_info(self):
+        try:
+            current_player_id = self.game.current_player_turn # 当前轮到行动的玩家
+
+            # Get action masks using the action_masks method
+            action_masks_flat = self.action_masks()
 
             # 返回包含动作掩码和其他调试信息的字典
             # MaskablePPO 会查找 "action_mask" 这个键
             return {
-                "action_mask": action_masks_tuple,
+                "action_mask": action_masks_flat,
                 "scores": [self.game.scores[0], self.game.scores[1]], # 包含当前分数
                 "winner": self.game.winner if hasattr(self.game, 'winner') else None, # 包含胜利者信息
                 # 您可以根据需要添加其他调试信息
@@ -693,11 +733,9 @@ class SealSlammersEnv(gym.Env):
             traceback.print_exc()
             # 在出错时返回一个默认的、结构正确的掩码，以便让检查通过（但训练会是错误的）
             # 这主要是为了暴露 get_info 内部的错误
-            default_object_mask = np.full(self.num_objects_per_player, True, dtype=bool)
-            default_angle_mask = np.full(self.action_space.nvec[1], True, dtype=bool)
-            default_strength_mask = np.full(self.action_space.nvec[2], True, dtype=bool)
+            total_actions = self.action_space.nvec[0] * self.action_space.nvec[1] * self.action_space.nvec[2]
             return {
-                "action_mask": (default_object_mask, default_angle_mask, default_strength_mask),
+                "action_mask": np.ones(total_actions, dtype=bool),
                 "scores": [0, 0], # Default scores
                 "winner": None,
                 "error_in_get_info": str(e) # 标记错误发生
@@ -714,22 +752,20 @@ class SealSlammersEnv(gym.Env):
         current_opponent_score = self.game.scores[opponent_player_id]
 
         # Reward for increasing own score (typically by KOing an opponent)
-        reward += score_diff_p_current * 50.0
+        reward += score_diff_p_current * 100.0  # 增加得分奖励
 
-        # # Penalty for opponent increasing their score (e.g. if self-KO or complex interaction)
-        # reward -= (current_opponent_score - initial_opponent_score) * 50.0
-
-        if not selected_obj: # Penalty for invalid action (e.g., chose KO\'d object, out of bounds)
-            reward -= 1000.0
-            # No need to increment consecutive_meaningless_actions here, as this is a different kind of bad action.
-            # Or, we could consider it a "super" meaningless action. For now, keeping separate.
+        if not selected_obj: # Penalty for invalid action (e.g., chose KO'd object, out of bounds)
+            reward -= 50.0  # 大幅减少无效动作惩罚
         else: # Valid object was selected
+            # 给予选择有效对象的小幅奖励
+            reward += 1.0
+            
             # --- Reward for damaging an opponent (Tiered based on damage relative to attacker's ATK) ---
             any_damage_dealt_to_opponent = False
             total_damage_dealt_to_opponent_hp = 0 # Tracks total HP damage dealt
             
             # Get the attack power of the selected object (attacker)
-            attacker_atk = selected_obj.attack if selected_obj else OBJECT_DEFAULT_ATTACK # Fallback if selected_obj is None (should not happen here)
+            attacker_atk = selected_obj.attack if selected_obj else OBJECT_DEFAULT_ATTACK
 
             if initial_hp_states: 
                 for obj_idx, hp_before_action in enumerate(initial_hp_states[opponent_player_id]):
@@ -741,81 +777,44 @@ class SealSlammersEnv(gym.Env):
                         if damage_dealt_to_this_obj > 0:
                             total_damage_dealt_to_opponent_hp += damage_dealt_to_this_obj
                             any_damage_dealt_to_opponent = True
-                            
-                            # Tiered reward based on damage dealt relative to attacker's ATK
-                            # This approximates rewarding "hitting multiple enemies" by rewarding high total damage in one go.
-                            # If actual_strength_magnitude was used, it might be a proxy for "hitting hard"
-                            # For now, let's use a simpler multiplier on total HP damage.
-                            # The idea of "hitting multiple enemies" is better captured by total damage dealt
-                            # across all enemies in this single action.
 
             # Base reward for any damage
             if any_damage_dealt_to_opponent:
-                reward += total_damage_dealt_to_opponent_hp * 1.0 # Base reward for HP damage
+                reward += total_damage_dealt_to_opponent_hp * 2.0 # 增加伤害奖励
 
-                # Tiered bonus based on total damage dealt in this action vs attacker's ATK
-                # This is a proxy for "hitting multiple units hard" or "a very effective hit"
-                if attacker_atk > 0: # Avoid division by zero
-                    damage_multiplier_tiers = 0
-                    if total_damage_dealt_to_opponent_hp >= attacker_atk * 3: # Approx. 3 units hit effectively or one super hit
-                        damage_multiplier_tiers = 3 
-                        reward += total_damage_dealt_to_opponent_hp * 27.0 # Strongest bonus
-                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 2: # Approx. 2 units hit effectively
-                        damage_multiplier_tiers = 2
-                        reward += total_damage_dealt_to_opponent_hp * 9.0  # Medium bonus
-                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 1: # Approx. 1 unit hit effectively
-                        damage_multiplier_tiers = 1
-                        reward += total_damage_dealt_to_opponent_hp * 3.0   # Smallest bonus
+                # Tiered bonus based on total damage dealt
+                if attacker_atk > 0:
+                    if total_damage_dealt_to_opponent_hp >= attacker_atk * 3:
+                        reward += total_damage_dealt_to_opponent_hp * 5.0  # 减少最高奖励
+                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 2:
+                        reward += total_damage_dealt_to_opponent_hp * 3.0  
+                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 1:
+                        reward += total_damage_dealt_to_opponent_hp * 1.5   
             
-            # --- Penalty for "meaningless" valid action & Progressive Penalty---
+            # --- 简化"无意义"动作的惩罚 ---
             if score_diff_p_current == 0 and \
                (current_opponent_score - initial_opponent_score) == 0 and \
                not any_damage_dealt_to_opponent:
                 self.consecutive_meaningless_actions += 1
-                # Base penalty + progressive penalty
-                reward -= (10.0 + (self.consecutive_meaningless_actions -1) * 10.0) 
+                # 减少惩罚强度
+                reward -= min(5.0 + (self.consecutive_meaningless_actions -1) * 2.0, 20.0) # 最大惩罚20
             else:
                 # If the action was meaningful, reset the counter
                 self.consecutive_meaningless_actions = 0
 
-        # --- Strategic Positioning Reward (Proximity to Opponents) ---
-        if selected_obj and not terminated : # Only if a valid action was taken and game not over
-            current_player_active_objects = [obj for obj in self.game.players_objects[current_player_id] if obj.hp > 0]
-            opponent_active_objects = [obj for obj in self.game.players_objects[opponent_player_id] if obj.hp > 0]
-
-            if current_player_active_objects and opponent_active_objects:
-                total_min_dist_to_opponent = 0
-                num_active_player_units = 0
-
-                for p_obj in current_player_active_objects:
-                    min_dist_for_this_obj = float('inf')
-                    for o_obj in opponent_active_objects:
-                        dist = math.hypot(p_obj.x - o_obj.x, p_obj.y - o_obj.y)
-                        min_dist_for_this_obj = min(min_dist_for_this_obj, dist)
-                    
-                    if min_dist_for_this_obj != float('inf'):
-                        total_min_dist_to_opponent += min_dist_for_this_obj
-                        num_active_player_units +=1
-                
-                if num_active_player_units > 0:
-                    avg_min_dist = total_min_dist_to_opponent / num_active_player_units
-                    # Reward for being closer. Max screen diagonal is ~sqrt(1000^2 + 600^2) ~= 1166
-                    # We want higher reward for smaller distance.
-                    # Let's use a scale factor and subtract from a base to make it positive.
-                    # Example: Max reward of 2.0 for this component.
-                    # (1.0 - (avg_min_dist / SCREEN_WIDTH)) ensures value is between 0 and 1 (approx)
-                    # Adjust scaling factor as needed.
-                    proximity_reward = (1.0 - (avg_min_dist / (SCREEN_WIDTH * 0.5))) * 0.5 
-                    reward += max(0, proximity_reward) # Ensure it doesn't go negative if avg_min_dist is very large
+        # --- 简化位置奖励 ---
+        if selected_obj and not terminated:
+            # 给予简单的移动奖励，鼓励探索
+            reward += 0.5
 
         if terminated:
             if self.game.winner == current_player_id:
-                reward += 500.0
+                reward += 200.0  # 减少胜利奖励
             elif self.game.winner == opponent_player_id:
-                reward -= 500.0
+                reward -= 200.0  # 减少失败惩罚
         else:
-            # --- Time-based penalty (if game not terminated) ---
-            reward -= 0.5 # Small penalty per step to encourage faster wins
+            # --- 减少时间惩罚 ---
+            reward -= 0.1 # 更小的时间惩罚
 
         return reward
 
@@ -848,16 +847,14 @@ class SealSlammersEnv(gym.Env):
             initial_hp_states.append([obj.hp for obj in p_objs])
 
         if selected_obj:
-            pull_angle_rad = (angle_idx / 72.0) * 2 * math.pi  # Angle of the "pull" action (NOW 72 directions)
+            pull_angle_rad = (angle_idx / 36.0) * 2 * math.pi  # 更新角度计算 (现在是36个方向)
             launch_angle_rad = pull_angle_rad + math.pi  # Launch is opposite to pull
 
             # ADDED: Set the object's angle based on the RL agent's chosen launch direction.
-            # This ensures the object faces the correct direction at the moment of launch by an agent.
-            # This angle will persist during movement due to the change in GameObject.move().
             selected_obj.angle = launch_angle_rad
 
-            strength_scale = (strength_idx + 1) / 5.0  # 0 to 4 -> 0.2 to 1.0
-            actual_strength_magnitude = strength_scale * MAX_LAUNCH_STRENGTH_RL # This is launch velocity magnitude
+            strength_scale = (strength_idx + 1) / 3.0  # 更新力度计算: 0 to 2 -> 0.33 to 1.0
+            actual_strength_magnitude = strength_scale * MAX_LAUNCH_STRENGTH_RL
 
             # launch_vx, launch_vy is the desired velocity of the object in the launch direction
             launch_vx = math.cos(launch_angle_rad) * actual_strength_magnitude
@@ -919,9 +916,9 @@ class SealSlammersEnv(gym.Env):
         reward = self._calculate_reward(initial_scores, initial_hp_states, selected_obj, terminated, current_player_id)
         
         # ADDED: Apply the specific, additional penalty if an already moved object was selected.
-        # This stacks on top of the -1000 penalty from _calculate_reward (because selected_obj would be None).
+        # This stacks on top of the -50 penalty from _calculate_reward (because selected_obj would be None).
         if attempted_to_select_moved_object:
-            reward -= 250.0  # Example value for the explicit, independent penalty. Tune as needed.
+            reward -= 10.0  # 大幅减少惩罚，从250降到10
             
         # Respawn KO\'d objects before turn progression (if game not over)
         if not terminated:

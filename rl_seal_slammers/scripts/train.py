@@ -20,16 +20,16 @@ from rl_seal_slammers.envs.seal_slammers_env import SealSlammersEnv
 
 # --- Parameters ---
 NUM_OBJECTS_PER_PLAYER = 3
-TOTAL_TIMESTEPS = 1_000_000  # 示例：增加训练步数
+TOTAL_TIMESTEPS = 2_000_000  # 增加训练步数
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "sb3_maskable_ppo_sealslammers_mlp")
 MODEL_SAVE_DIR = os.path.join(PROJECT_ROOT, "models", "sb3_maskable_ppo_sealslammers_mlp")
 MODEL_NAME_PREFIX = "maskable_ppo_sealslammers_mlp_model"
-EVAL_FREQ = 25000  # 每隔多少步评估一次
-N_EVAL_EPISODES = 5 # 评估时运行多少个 episode
+EVAL_FREQ = 50000  # 增加评估频率
+N_EVAL_EPISODES = 10 # 增加评估episode数
 BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_best")
 
-# 并行环境数量 (如果使用 SubprocVecEnv)
-N_ENVS = 16 # 示例：使用4个并行环境，可以根据您的CPU核心数调整
+# 减少并行环境数量以获得更稳定的训练
+N_ENVS = 8 # 从16减少到8，减少环境间差异
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
@@ -66,17 +66,21 @@ def train_agent():
     model = MaskablePPO(
         "MlpPolicy",
         env,
-        learning_rate=3e-4,       # 示例值
-        n_steps=512 // N_ENVS,   # 每个并行环境的步数，总步数 n_steps * N_ENVS
-        batch_size=64,            # 示例值
-        n_epochs=10,              # 示例值
-        gamma=0.99,               # 示例值
-        gae_lambda=0.95,          # 示例值
-        ent_coef=0.01,            # 示例值，可以调整以平衡探索和利用
-        vf_coef=0.5,              # 示例值
-        max_grad_norm=0.5,        # 示例值
+        learning_rate=1e-4,       # 降低学习率
+        n_steps=2048 // N_ENVS,   # 增加每个环境的步数
+        batch_size=128,           # 增加batch size
+        n_epochs=4,               # 减少epochs避免过拟合
+        gamma=0.99,               
+        gae_lambda=0.95,          
+        ent_coef=0.01,            # 保持探索性
+        vf_coef=0.5,              
+        max_grad_norm=0.5,        
         verbose=1,
-        tensorboard_log=LOG_DIR
+        tensorboard_log=LOG_DIR,
+        policy_kwargs=dict(
+            net_arch=[256, 256],  # 增加网络容量
+            activation_fn=torch.nn.ReLU  # 明确指定激活函数
+        )
     )
     print("MaskablePPO model created.")
     print(f"Observation space: {env.observation_space}")
