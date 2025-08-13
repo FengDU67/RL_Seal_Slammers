@@ -3,23 +3,56 @@ import numpy as np
 import argparse
 import sys
 import math
-
-# Add the parent directory to sys.path to allow imports from envs
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Try to import the environment and SB3 PPO
+# Ensure both package root and project root are on sys.path
+_current_dir = os.path.abspath(os.path.dirname(__file__))
+_pkg_dir = os.path.abspath(os.path.join(_current_dir, '..'))            # rl_seal_slammers/
+_root_dir = os.path.abspath(os.path.join(_current_dir, '..', '..'))     # project root
+for _p in (_pkg_dir, _root_dir):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+# Fallback-friendly import for shared physics util
 try:
-    from envs.seal_slammers_env import (SealSlammersEnv, SCREEN_WIDTH, SCREEN_HEIGHT, 
-                                       OBJECT_RADIUS, MAX_LAUNCH_STRENGTH_RL, 
-                                       MAX_PULL_RADIUS_MULTIPLIER, FORCE_MULTIPLIER, 
-                                       FRICTION, RED, BLACK, GREEN, BLUE, GREY, LIGHT_GREY, 
-                                       ELASTICITY, OBJECT_DEFAULT_HP, OBJECT_DEFAULT_ATTACK) # Added defaults
+    from rl_seal_slammers.physics_utils import simulate_projected_path  # When running from project root
+except ImportError:
+    try:
+        from physics_utils import simulate_projected_path  # When running from inside package dir
+    except ImportError:
+        simulate_projected_path = None
+
+# Import environment class and constants with fallbacks
+try:
+    from rl_seal_slammers.envs.seal_slammers_env import (
+        SealSlammersEnv,
+        SCREEN_WIDTH, SCREEN_HEIGHT,
+        OBJECT_RADIUS, MAX_LAUNCH_STRENGTH_RL, MAX_PULL_RADIUS_MULTIPLIER,
+        FORCE_MULTIPLIER, FRICTION,
+        RED, BLACK, GREEN, BLUE, GREY, LIGHT_GREY,
+        ELASTICITY, OBJECT_DEFAULT_HP, OBJECT_DEFAULT_ATTACK
+    )
+except ImportError:
+    try:
+        from envs.seal_slammers_env import (
+            SealSlammersEnv,
+            SCREEN_WIDTH, SCREEN_HEIGHT,
+            OBJECT_RADIUS, MAX_LAUNCH_STRENGTH_RL, MAX_PULL_RADIUS_MULTIPLIER,
+            FORCE_MULTIPLIER, FRICTION,
+            RED, BLACK, GREEN, BLUE, GREY, LIGHT_GREY,
+            ELASTICITY, OBJECT_DEFAULT_HP, OBJECT_DEFAULT_ATTACK
+        )
+    except ImportError as _env_import_err:
+        print(f"Failed to import environment and constants: {_env_import_err}")
+        sys.exit(1)
+
+# RL algorithms
+try:
+    from sb3_contrib import MaskablePPO
     from stable_baselines3 import PPO
-except ImportError as e:
-    print(f"Error importing necessary modules: {e}")
-    print("Please ensure 'stable_baselines3' is installed and the script is run from a context where 'envs' module is found.")
-    sys.exit(1)
+except ImportError:
+    MaskablePPO = None
+    PPO = None
 
 # --- Helper Functions ---
 
@@ -134,101 +167,71 @@ def get_human_action(env, player_id):
         
         # current_mouse_x, current_mouse_y = pygame.mouse.get_pos() # Already got this above
 
-        # --- Drag line and projection logic (adapted from main.py) ---
+        # --- Drag line and projection logic (adapted & upgraded) ---
         obj_center_x = selected_object_game_instance.x
         obj_center_y = selected_object_game_instance.y
-
         drag_visual_dx = current_mouse_x - obj_center_x
         drag_visual_dy = current_mouse_y - obj_center_y
         current_pull_distance = math.hypot(drag_visual_dx, drag_visual_dy)
         max_effective_pull_pixels = OBJECT_RADIUS * MAX_PULL_RADIUS_MULTIPLIER
-
         display_dx = drag_visual_dx
         display_dy = drag_visual_dy
-
-        if current_pull_distance > max_effective_pull_pixels:
+        if current_pull_distance > max_effective_pull_pixels and current_pull_distance > 0:
             ratio = max_effective_pull_pixels / current_pull_distance
             display_dx *= ratio
             display_dy *= ratio
-        
-        # Draw the slingshot band (from object towards mouse, capped visually)
         slingshot_band_end_x = obj_center_x + display_dx
         slingshot_band_end_y = obj_center_y + display_dy
-        pygame.draw.line(env.window_surface, RED, 
-                         (obj_center_x, obj_center_y),
-                         (slingshot_band_end_x, slingshot_band_end_y), 3)
-        pygame.draw.circle(env.window_surface, RED, 
-                           (int(slingshot_band_end_x), int(slingshot_band_end_y)), 6)
-
-        # --- Projected path (dotted line, adapted from main.py) ---
-        # The launch force is opposite to the pull direction.
-        launch_force_dir_x = obj_center_x - current_mouse_x # Inverted from drag_visual_dx for launch
-        launch_force_dir_y = obj_center_y - current_mouse_y # Inverted from drag_visual_dy for launch
-
-        # Cap the pull distance for force calculation (used for projection and final action)
-        actual_pull_distance_for_force = current_pull_distance
-        if actual_pull_distance_for_force > max_effective_pull_pixels:
-            actual_pull_distance_for_force = max_effective_pull_pixels
-        
-        # If pull is too small, consider it zero for projection (matches main.py behavior)
-        if actual_pull_distance_for_force < 5: # Threshold from main.py
-            scaled_launch_force_dx = 0
-            scaled_launch_force_dy = 0
+        pygame.draw.line(env.window_surface, RED,(obj_center_x, obj_center_y),(slingshot_band_end_x, slingshot_band_end_y), 3)
+        pygame.draw.circle(env.window_surface, RED,(int(slingshot_band_end_x), int(slingshot_band_end_y)), 6)
+        # Raw (continuous) pull vector (for angle base)
+        raw_pull_dx = drag_visual_dx
+        raw_pull_dy = drag_visual_dy
+        # 1) Continuous pull angle
+        if raw_pull_dx == 0 and raw_pull_dy == 0:
+            pull_angle_rad = 0.0
         else:
-            # Scale the launch_force_dir vector by the (capped) actual_pull_distance_for_force
-            # The launch_force_dir is already pointing in the launch direction.
-            # We need its unit vector multiplied by the effective pull strength.
-            dir_len = math.hypot(launch_force_dir_x, launch_force_dir_y)
-            if dir_len > 0:
-                scaled_launch_force_dx = (launch_force_dir_x / dir_len) * actual_pull_distance_for_force
-                scaled_launch_force_dy = (launch_force_dir_y / dir_len) * actual_pull_distance_for_force
-            else:
-                scaled_launch_force_dx = 0
-                scaled_launch_force_dy = 0
-
-        # Projection parameters from envs.seal_slammers_env constants
-        # FORCE_MULTIPLIER is defined in envs.seal_slammers_env
-        # FRICTION is defined in envs.seal_slammers_env
-        # We need to import them or pass them if they are not already available here.
-        # For now, assuming they are available via env.game or env directly if they were constants there.
-        # Let's use the constants directly from the import for now.
-        # from envs.seal_slammers_env import FORCE_MULTIPLIER, FRICTION (already imported)
-
-        proj_vx = scaled_launch_force_dx * FORCE_MULTIPLIER 
-        proj_vy = scaled_launch_force_dy * FORCE_MULTIPLIER
-
-        temp_x, temp_y = obj_center_x, obj_center_y
-        num_projection_points = 60 
-        # FRICTION is already available from envs.seal_slammers_env import
-        # proj_radius = selected_object_game_instance.radius # Not strictly needed for point projection
-
-        if not (scaled_launch_force_dx == 0 and scaled_launch_force_dy == 0):
-            # Use a small radius for projection points for boundary checks, can be 0 if only center is checked
-            proj_point_radius = 1 # Effectively a point for collision
-            for i in range(num_projection_points):
-                temp_x += proj_vx
-                temp_y += proj_vy
-                proj_vx *= FRICTION 
-                proj_vy *= FRICTION
-
-                # Boundary collision for projection
-                if temp_x - proj_point_radius < 0:
-                    temp_x = proj_point_radius
-                    proj_vx *= -ELASTICITY 
-                elif temp_x + proj_point_radius > SCREEN_WIDTH:
-                    temp_x = SCREEN_WIDTH - proj_point_radius
-                    proj_vx *= -ELASTICITY
-                
-                if temp_y - proj_point_radius < 0:
-                    temp_y = proj_point_radius
-                    proj_vy *= -ELASTICITY
-                elif temp_y + proj_point_radius > SCREEN_HEIGHT:
-                    temp_y = SCREEN_HEIGHT - proj_point_radius
-                    proj_vy *= -ELASTICITY
-
-                if i % 5 == 0: # Draw a dot every 5 points for a dashed line effect
-                    pygame.draw.circle(env.window_surface, BLACK, (int(temp_x), int(temp_y)), 2)
-        # --- End of projection ---        
+            pull_angle_rad = math.atan2(raw_pull_dy, raw_pull_dx)
+            if pull_angle_rad < 0:
+                pull_angle_rad += 2 * math.pi
+        # 2) Discretize angle to 72 bins (env uses this pull angle then +pi for launch)
+        angle_bin_size = 2 * math.pi / 72
+        angle_idx_quant = int(round(pull_angle_rad / angle_bin_size)) % 72
+        pull_angle_quant = angle_idx_quant * angle_bin_size
+        # 3) Capped pull magnitude in pixels
+        capped_pull_pixels = min(current_pull_distance, max_effective_pull_pixels)
+        # 4) Discretize strength to 5 levels (0..4) same as action encoding in get_human_action finalize logic
+        strength_ratio_cont = 0.0 if max_effective_pull_pixels == 0 else capped_pull_pixels / max_effective_pull_pixels
+        strength_idx_quant = int(round(strength_ratio_cont * 4))
+        if strength_idx_quant < 0: strength_idx_quant = 0
+        if strength_idx_quant > 4: strength_idx_quant = 4
+        # 5) Map strength_idx -> strength_scale identical to env.step: (idx+1)/5.0
+        strength_scale_quant = (strength_idx_quant + 1) / 5.0
+        # 6) Convert to actual launch magnitude (velocity scalar)
+        actual_strength_magnitude_quant = strength_scale_quant * MAX_LAUNCH_STRENGTH_RL
+        # 7) Launch angle is opposite to pull direction
+        launch_angle_quant = pull_angle_quant + math.pi
+        # 8) Quantized initial velocity (what env will reconstruct)
+        init_vx_quant = math.cos(launch_angle_quant) * actual_strength_magnitude_quant
+        init_vy_quant = math.sin(launch_angle_quant) * actual_strength_magnitude_quant
+        # 9) Draw discrete (quantized) predicted trajectory so it matches env.step
+        if strength_idx_quant >= 0 and (abs(init_vx_quant) > 1e-6 or abs(init_vy_quant) > 1e-6):
+            if simulate_projected_path:
+                projected_points = simulate_projected_path(
+                    selected_object_game_instance,
+                    env.game.players_objects,
+                    init_vx_quant,
+                    init_vy_quant,
+                    steps=120,
+                    friction=FRICTION,
+                    min_speed=0.1,
+                    screen_width=SCREEN_WIDTH,
+                    screen_height=SCREEN_HEIGHT,
+                )
+                for i, (px, py) in enumerate(projected_points):
+                    if i % 3 == 0:
+                        pygame.draw.circle(env.window_surface, BLACK, (int(px), int(py)), 2)
+        # --- End quantized projection ---
 
         pygame.display.flip()
 
@@ -273,25 +276,16 @@ def get_human_action(env, player_id):
 
     # Discretize pull_angle_rad (72 directions for action space)
     # This angle_idx will be interpreted by the env as the pull angle.
-    angle_idx = round(pull_angle_rad / (2 * math.pi / 72)) % 72 # Updated to 72 directions
+    angle_idx = round(pull_angle_rad / (2 * math.pi / 72)) % 72
 
     # Discretize strength (5 levels for action space)
-    # Use MAX_PULL_RADIUS_MULTIPLIER for scaling, consistent with main.py's concept
     visual_max_pull_strength = OBJECT_RADIUS * MAX_PULL_RADIUS_MULTIPLIER 
-    
-    if visual_max_pull_strength == 0: # Avoid division by zero if OBJECT_RADIUS is 0
+    if visual_max_pull_strength == 0:
         strength_ratio = 0.0
     else:
         strength_ratio = min(strength_abs / visual_max_pull_strength, 1.0)
+    strength_idx = int(round(strength_ratio * 4)) # 0..4
     
-    # Map strength_ratio (0.0 to 1.0) to strength_idx (0 to 4)
-    # If strength_abs is very small (e.g., less than a pixel, or if it was 0 initially),
-    # strength_ratio will be close to 0, and strength_idx will be 0.
-    # This corresponds to the minimum launch power in the env (0.2 * MAX_LAUNCH_STRENGTH_RL).
-    # This behavior is slightly different from main.py's "no launch if pull < 5 pixels",
-    # but aligns with the discrete action space of the RL environment.
-    strength_idx = int(round(strength_ratio * 4)) # round() for better mapping: 0.0->0, 0.25->1, 0.5->2, 0.75->3, 1.0->4
-
     action = [object_game_idx, angle_idx, strength_idx]
     print(f"Player {player_id + 1} action: Object {action[0]+1}, Pull Angle Index {action[1]}/72, Strength Index {action[2]}")
     return action
@@ -357,10 +351,17 @@ def play_game(mode, num_objects=3, model_path=None,
         if os.path.exists(model_path):
             print(f"Loading PPO model from: {model_path}")
             try:
-                ppo_model = PPO.load(model_path)
-                print("PPO model loaded successfully.")
-            except Exception as e:
-                print(f"Error loading PPO model: {e}. Falling back to random AI.")
+                # Try MaskablePPO first (matches training script)
+                ppo_model = MaskablePPO.load(model_path)
+                print("Model loaded with MaskablePPO.")
+            except Exception as e_mask:
+                print(f"MaskablePPO load failed: {e_mask}. Trying stable-baselines3 PPO...")
+                try:
+                    ppo_model = PPO.load(model_path)
+                    print("Model loaded with PPO.")
+                except Exception as e_ppo:
+                    print(f"Error loading PPO model: {e_ppo}. Falling back to random AI.")
+                    ppo_model = None
         else:
             print(f"Model path not found: {model_path}. Falling back to random AI.")
 
@@ -410,15 +411,35 @@ def play_game(mode, num_objects=3, model_path=None,
             if ppo_model:
                 # Use PPO model to predict action
                 print(f"AI Player {current_player_id + 1} (PPO Model) is thinking...")
-                # For MlpPolicy, state and episode_start are not typically used in predict, 
-                # unless the underlying model or a wrapper explicitly requires them.
-                # Standard PPO with MlpPolicy does not require them for basic prediction.
-                action_array, _ = ppo_model.predict(
-                    obs,
-                    # state=lstm_state_ai, # Removed for MlpPolicy
-                    # episode_start=episode_start_ai, # Removed for MlpPolicy
-                    deterministic=True
-                )
+                try:
+                    # If using MaskablePPO, pass the current action mask so it respects invalid actions
+                    if isinstance(ppo_model, MaskablePPO):
+                        current_mask = None
+                        try:
+                            current_mask = env.action_masks()
+                        except Exception as e_mask_fetch:
+                            print(f"[WARN] Failed to fetch action mask for predict: {e_mask_fetch}")
+                            current_mask = None
+                        if current_mask is not None:
+                            action_array, _ = ppo_model.predict(
+                                obs,
+                                deterministic=True,
+                                action_masks=current_mask,
+                            )
+                        else:
+                            action_array, _ = ppo_model.predict(
+                                obs,
+                                deterministic=True,
+                            )
+                    else:
+                        # Standard PPO does not take action masks
+                        action_array, _ = ppo_model.predict(
+                            obs,
+                            deterministic=True,
+                        )
+                except Exception as e_pred:
+                    print(f"[ERROR] PPO predict failed: {e_pred}. Falling back to random action.")
+                    action_array = np.array(get_random_ai_action(env, current_player_id))
                 action = action_array.tolist() 
                 # episode_start_ai = False # Removed for MlpPolicy
                 print(f"AI Player {current_player_id + 1} (PPO Model) action: Object {action[0]+1}, Pull Angle Index {action[1]}/72, Strength Index {action[2]}")
@@ -467,6 +488,19 @@ def play_game(mode, num_objects=3, model_path=None,
     sys.exit()
 
 
+def _simulate_projected_path_play(env, source_obj, init_vx, init_vy, steps=120):
+    return simulate_projected_path(
+        source_obj,
+        env.game.players_objects,
+        init_vx,
+        init_vy,
+        steps=steps,
+        friction=FRICTION,
+        min_speed=0.1,
+        screen_width=SCREEN_WIDTH,
+        screen_height=SCREEN_HEIGHT,
+    )
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Seal Slammers.")
     parser.add_argument("--mode", type=str, default="human_vs_human",
@@ -486,8 +520,8 @@ if __name__ == "__main__":
     # play.py is in RL_Seal_Slammers/rl_seal_slammers/scripts/play.py
     # Project root is RL_Seal_Slammers/
     project_root_for_play_script = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    # Updated default model path to align with the new training script's output
-    default_model_path = os.path.join(project_root_for_play_script, "models", "sb3_ppo_sealslammers_mlp", "ppo_sealslammers_mlp_model_final.zip") # CHANGED
+    # Updated default model path to align with the new training script's output (MaskablePPO)
+    default_model_path = os.path.join(project_root_for_play_script, "models", "sb3_maskable_ppo_sealslammers_mlp", "maskable_ppo_sealslammers_mlp_model_final.zip")
     parser.add_argument("--model-path", type=str, default=default_model_path,
                         help=f"Path to the trained PPO model .zip file (default: {default_model_path}). Used if mode involves AI.")
     

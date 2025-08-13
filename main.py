@@ -2,6 +2,7 @@ import pygame
 import math
 import random
 from typing import List, Optional
+from rl_seal_slammers.physics_utils import simulate_projected_path  # Added shared projection
 
 # --- 常量 ---
 SCREEN_WIDTH = 1000
@@ -259,114 +260,65 @@ class Game:
             drag_visual_dy = mouse_y - obj_center_y
             current_pull_distance = math.hypot(drag_visual_dx, drag_visual_dy)
 
-            # Consistent maximum pull distance for visuals and force projection
             max_effective_pull_pixels = MAX_PULL_RADIUS_MULTIPLIER * OBJECT_RADIUS
 
-            # Limit the visual length of the slingshot pull line
             display_dx = drag_visual_dx
             display_dy = drag_visual_dy
+            if current_pull_distance > max_effective_pull_pixels and current_pull_distance > 0:
+                scale_factor = max_effective_pull_pixels / current_pull_distance
+                display_dx = drag_visual_dx * scale_factor
+                display_dy = drag_visual_dy * scale_factor
 
-            if current_pull_distance > max_effective_pull_pixels: # Use consistent cap
-                if current_pull_distance > 0:
-                    scale_factor = max_effective_pull_pixels / current_pull_distance
-                    display_dx = drag_visual_dx * scale_factor
-                    display_dy = drag_visual_dy * scale_factor
-                else:
-                    display_dx, display_dy = 0,0
-
-            # Draw the slingshot band (from object towards mouse)
+            # Draw slingshot band
             slingshot_band_end_x = obj_center_x + display_dx
             slingshot_band_end_y = obj_center_y + display_dy
             pygame.draw.line(self.screen, RED, (obj_center_x, obj_center_y), (slingshot_band_end_x, slingshot_band_end_y), 3)
             pygame.draw.circle(self.screen, RED, (int(slingshot_band_end_x), int(slingshot_band_end_y)), 6)
 
-            # --- Projected path (dotted line) ---
-            launch_force_dir_x = obj_center_x - mouse_x
-            launch_force_dir_y = obj_center_y - mouse_y
+            # Compute capped launch force (pull vector reversed)
+            launch_force_dx = obj_center_x - mouse_x
+            launch_force_dy = obj_center_y - mouse_y
+            if current_pull_distance > max_effective_pull_pixels and current_pull_distance > 0:
+                force_scale = max_effective_pull_pixels / current_pull_distance
+                launch_force_dx *= force_scale
+                launch_force_dy *= force_scale
+            elif current_pull_distance < 5:
+                launch_force_dx = 0
+                launch_force_dy = 0
 
-            scaled_launch_force_dx = launch_force_dir_x
-            scaled_launch_force_dy = launch_force_dir_y
-            
-            # Cap the pull distance for force calculation (used for projection)
-            if current_pull_distance > max_effective_pull_pixels: # Use consistent cap
-                if current_pull_distance > 0:
-                    force_scale = max_effective_pull_pixels / current_pull_distance
-                    scaled_launch_force_dx = launch_force_dir_x * force_scale
-                    scaled_launch_force_dy = launch_force_dir_y * force_scale
-                else:
-                    scaled_launch_force_dx, scaled_launch_force_dy = 0,0
-            elif current_pull_distance < 5: # Minimal pull threshold
-                 scaled_launch_force_dx, scaled_launch_force_dy = 0,0
+            strength_multiplier = 0.08 * 4  # Keep consistent with apply_force
+            init_vx = launch_force_dx * strength_multiplier
+            init_vy = launch_force_dy * strength_multiplier
 
-            strength_multiplier = 0.08 * 4 # Synchronized with apply_force
-            proj_vx = scaled_launch_force_dx * strength_multiplier 
-            proj_vy = scaled_launch_force_dy * strength_multiplier
+            # --- Improved projected path via lightweight physics simulation ---
+            if launch_force_dx != 0 or launch_force_dy != 0:
+                projected_points = simulate_projected_path(
+                    self.selected_object,
+                    self.players_objects,
+                    init_vx,
+                    init_vy,
+                    steps=120,
+                    friction=0.98,
+                    min_speed=0.1,
+                    screen_width=SCREEN_WIDTH,
+                    screen_height=SCREEN_HEIGHT,
+                )
+                for i, (px, py) in enumerate(projected_points):
+                    if i % 3 == 0:
+                        pygame.draw.circle(self.screen, BLACK, (int(px), int(py)), 2)
 
-            temp_x, temp_y = obj_center_x, obj_center_y
-            num_projection_points = 60 
-            friction_coefficient = 0.98 
-            proj_radius = self.selected_object.radius
-
-            if scaled_launch_force_dx == 0 and scaled_launch_force_dy == 0:
-                pass 
-            else:
-                for i in range(num_projection_points):
-                    temp_x += proj_vx
-                    temp_y += proj_vy
-                    proj_vx *= friction_coefficient
-                    proj_vy *= friction_coefficient
-
-                    # --- Object-Object Collision Check for Projection ---
-                    collided_with_object_this_step = False
-                    for player_objs_list in self.players_objects:
-                        if collided_with_object_this_step: break
-                        for other_obj in player_objs_list:
-                            if other_obj is self.selected_object or other_obj.hp <= 0:
-                                continue
-                            
-                            dist_to_other = math.hypot(temp_x - other_obj.x, temp_y - other_obj.y)
-                            if dist_to_other < proj_radius + other_obj.radius:
-                                # Collision detected
-                                if dist_to_other == 0: # Avoid division by zero
-                                    collision_nx, collision_ny = 1.0, 0.0 # Arbitrary normal
-                                else:
-                                    collision_nx = (temp_x - other_obj.x) / dist_to_other
-                                    collision_ny = (temp_y - other_obj.y) / dist_to_other
-
-                                # Reflect velocity (simple reflection off a static object, now with restitution)
-                                effective_restitution = min(self.selected_object.restitution, other_obj.restitution)
-
-                                dot_product = proj_vx * collision_nx + proj_vy * collision_ny
-                                proj_vx -= (1 + effective_restitution) * dot_product * collision_nx
-                                proj_vy -= (1 + effective_restitution) * dot_product * collision_ny
-                                
-                                # Adjust position to be just outside the collided object
-                                overlap = (proj_radius + other_obj.radius) - dist_to_other
-                                temp_x += collision_nx * (overlap + 0.1) # Epsilon to prevent sticking
-                                temp_y += collision_ny * (overlap + 0.1)
-                                
-                                collided_with_object_this_step = True
-                                break # Processed one collision, move to next projection step / boundary check
-                    
-                    # Boundary check for projection
-                    if temp_x - proj_radius < 0:
-                        temp_x = proj_radius
-                        proj_vx *= -self.selected_object.restitution # Use object's restitution
-                    elif temp_x + proj_radius > SCREEN_WIDTH:
-                        temp_x = SCREEN_WIDTH - proj_radius
-                        proj_vx *= -self.selected_object.restitution
-                    if temp_y - proj_radius < 0:
-                        temp_y = proj_radius
-                        proj_vy *= -self.selected_object.restitution
-                    elif temp_y + proj_radius > SCREEN_HEIGHT:
-                        temp_y = SCREEN_HEIGHT - proj_radius
-                        proj_vy *= -self.selected_object.restitution
-                    
-                    if abs(proj_vx) < 0.01 and abs(proj_vy) < 0.01: 
-                        break
-
-                    if i % 3 == 0: 
-                        pygame.draw.circle(self.screen, BLACK, (int(temp_x), int(temp_y)), 2)
+    def _simulate_projected_path(self, source_obj, init_vx, init_vy, steps=120):
+        return simulate_projected_path(
+            source_obj,
+            self.players_objects,
+            init_vx,
+            init_vy,
+            steps=steps,
+            friction=0.98,
+            min_speed=0.1,
+            screen_width=SCREEN_WIDTH,
+            screen_height=SCREEN_HEIGHT,
+        )
 
     def draw(self):
         self.screen.fill(WHITE)

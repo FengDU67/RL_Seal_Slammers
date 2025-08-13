@@ -5,6 +5,7 @@ import numpy as np
 import pygame
 import math
 import random # Ensure random is imported
+from rl_seal_slammers.physics_utils import simulate_projected_path  # Shared trajectory prediction
 
 # --- Constants ---
 SCREEN_WIDTH = 1000
@@ -31,19 +32,39 @@ INITIAL_ATTACK = 8
 DEFAULT_HP_RANGE = (35, 50)
 DEFAULT_ATK_RANGE = (7, 10)
 
-MAX_LAUNCH_STRENGTH_RL = 20.0 # Added for RL action scaling
-# MAX_LAUNCH_STRENGTH = 200 # This is more related to RL action scaling
-FORCE_MULTIPLIER = 0.08 * 4 # Adjusted to match main.py's effective multiplier
-FRICTION = 0.98 
-MIN_SPEED_THRESHOLD = 0.1 
-ELASTICITY = 1.0 # Updated from main.py's restitution
 MAX_PULL_RADIUS_MULTIPLIER = 4.0 # Added from main.py logic
+
+# Compute RL max launch strength to mirror main game's max drag distance * FORCE_MULTIPLIER
+FORCE_MULTIPLIER = 0.08 * 4  # Keep identical to main.py apply_force
+MAX_LAUNCH_STRENGTH_RL = OBJECT_RADIUS * MAX_PULL_RADIUS_MULTIPLIER * FORCE_MULTIPLIER  # 23*4*0.32 = 29.44
+FRICTION = 0.98
+MIN_SPEED_THRESHOLD = 0.1  # (Retained for other logic; not used in move stop now)
+ELASTICITY = 1.0
 
 MAX_VICTORY_POINTS = 5
 DAMAGE_COOLDOWN_FRAMES = 10 # From main.py
 
 HP_BAR_WIDTH = 40
 HP_BAR_HEIGHT = 5
+
+# --- Reward scaling constants (normalized magnitudes) ---
+KO_POINT_REWARD = 30.0           # per score point gained
+WIN_REWARD = 80.0
+LOSS_PENALTY = -80.0
+INVALID_ACTION_PENALTY = -15.0
+SELECTION_SHAPING_REWARD = 0.5   # scaled by shaping_scale
+POSITION_SHAPING_REWARD = 0.2    # scaled by shaping_scale
+COLLISION_SHAPING_REWARD = 1.5   # scaled by shaping_scale (no damage)
+DIST_REDUCTION_MAX_SHAPING = 2.5 # cap for distance shaping per action (scaled)
+ALIGNMENT_MAX_SHAPING = 0.5      # scaled by shaping_scale
+DAMAGE_BASE_PER_HP = 1.0         # core signal (unscaled)
+# Tier multipliers relative to attacker_atk thresholds (unscaled core bonuses)
+DAMAGE_TIER_MULTIPLIERS = {
+    1: 1.2,   # >= 1 * atk
+    2: 2.0,   # >= 2 * atk
+    3: 3.0    # >= 3 * atk
+}
+TIME_STEP_PENALTY = -0.05        # lighter time penalty
 
 # --- GameObject Class (Copied from main.py and adapted) ---
 class GameObject:
@@ -65,7 +86,9 @@ class GameObject:
         self.original_x = float(x)
         self.original_y = float(y)
         self.mass = mass
-        self.restitution = ELASTICITY # Match main.py's attribute name for clarity within GameObject
+        self.restitution = ELASTICITY
+        # Add moment_of_inertia for parity (not currently used elsewhere)
+        self.moment_of_inertia = 0.5 * self.mass * (self.radius ** 2)
 
         # Attributes from main.py's GameObject
         self.angle = 0.0 # For potential drawing or physics extensions
@@ -74,49 +97,43 @@ class GameObject:
         self.damage_intake_cooldown_frames = DAMAGE_COOLDOWN_FRAMES
         
 
-    def apply_force(self, dx, dy, strength_multiplier=FORCE_MULTIPLIER):
-        self.vx = -dx * strength_multiplier 
+    def apply_force(self, dx, dy, strength_multiplier=0.08 * 4):  # Match main.py constant directly
+        self.vx = -dx * strength_multiplier
         self.vy = -dy * strength_multiplier
         self.is_moving = True
-        self.has_moved_this_turn = True # Consistent with main.py
+        self.has_moved_this_turn = True
 
-    def move(self):
+    def move(self):  # Match main.py friction & stop condition
         if self.is_moving:
             self.x += self.vx
             self.y += self.vy
-
-            self.vx *= FRICTION 
-            self.vy *= FRICTION
-            
-            if math.hypot(self.vx, self.vy) < MIN_SPEED_THRESHOLD:
+            # Linear friction identical to main.py
+            self.vx *= 0.98
+            self.vy *= 0.98
+            # Stop condition uses component-wise thresholds like main.py
+            if abs(self.vx) < 0.1 and abs(self.vy) < 0.1:
                 self.vx = 0
                 self.vy = 0
                 self.is_moving = False
-                self.angular_velocity = 0 # Stop spinning if it was spinning
-
-        # Update angle from angular velocity (for spinning effect) - this remains
+        # Angle update & angular damping (extra, acceptable; keep)
         self.angle += self.angular_velocity
-        self.angular_velocity *= 0.97 # Angular friction/damping (TODO: Use a constant like ANGULAR_FRICTION)
+        self.angular_velocity *= 0.97
 
-    def check_boundary_collision(self, screen_width, screen_height):
+    def check_boundary_collision(self, screen_width, screen_height):  # Remove extra bottom damping to mirror main.py
         if self.x - self.radius < 0:
             self.x = self.radius
-            self.vx *= -self.restitution # Use self.restitution
+            self.vx *= -self.restitution
         elif self.x + self.radius > screen_width:
             self.x = screen_width - self.radius
-            self.vx *= -self.restitution # Use self.restitution
-
+            self.vx *= -self.restitution
         if self.y - self.radius < 0:
             self.y = self.radius
-            self.vy *= -self.restitution # Use self.restitution
+            self.vy *= -self.restitution
         elif self.y + self.radius > screen_height:
             self.y = screen_height - self.radius
-            self.vy *= -self.restitution # Use self.restitution
-            # Dampen if hitting bottom slowly (from main.py like logic, though main.py doesn't have this exact detail)
-            # This specific damping was in original env, keeping it.
-            if abs(self.vy) < MIN_SPEED_THRESHOLD * 2 and self.y + self.radius >= screen_height -1:
-                 self.vy = 0
-    
+            self.vy *= -self.restitution
+
+
     def take_damage(self, amount, current_game_frame):
         if current_game_frame - self.last_damaged_frame < self.damage_intake_cooldown_frames:
             return False # In cooldown
@@ -218,6 +235,9 @@ class Game:
         self._RESPAWN_SEARCH_STEP_DISTANCE_FACTOR = 0.75 # Factor of object radius
         self._RESPAWN_MAX_SPIRAL_LAYERS = 8
         self._RESPAWN_POINTS_PER_LAYER = 8
+
+        # NEW: flag to indicate whether any cross-team collision happened during the latest action simulation
+        self.enemy_collision_happened_this_step = False
 
         # Call reset_game_state with default HP/Attack values
         self.reset_game_state(p0_hp=INITIAL_HP, p0_atk=INITIAL_ATTACK, 
@@ -385,6 +405,9 @@ class Game:
                 min_dist = obj1.radius + obj2.radius
                 if distance < min_dist:
                     any_object_activity_this_frame = True # Collision occurred
+                    # Mark cross-team collision for shaping even if no damage is dealt
+                    if obj1.player_id != obj2.player_id:
+                        self.enemy_collision_happened_this_step = True
                     # --- Overlap Resolution (from main.py) ---
                     overlap = min_dist - distance
                     nx = dist_x / distance if distance != 0 else 1.0
@@ -436,7 +459,6 @@ class Game:
                                 # This part is tricky. main.py uses self.current_player_turn.
                                 # For the env, the "active" player for damage dealing should be the one
                                 # whose action is currently being processed.
-                                # Let's assume the `self.current_player_turn` in Game class reflects who *initiated* the action.
                                 
                                 attacker_obj, defender_obj = None, None
                                 if obj1.player_id == self.current_player_turn and obj2.player_id != self.current_player_turn:
@@ -528,11 +550,13 @@ class Game:
 # --- SealSlammersEnv Class (Gym Environment) ---
 class SealSlammersEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': FPS}
+    # Track active human-display environments to safely decide when to quit pygame fully
+    _active_display_envs = 0
 
     def __init__(self, render_mode=None, num_objects_per_player=NUM_OBJECTS_PER_PLAYER,
-                 p0_hp_fixed=None, p0_atk_fixed=None, # For fixed HP/ATK e.g. in play.py
+                 p0_hp_fixed=None, p0_atk_fixed=None,
                  p1_hp_fixed=None, p1_atk_fixed=None,
-                 hp_range=DEFAULT_HP_RANGE,         # For random HP/ATK in training
+                 hp_range=DEFAULT_HP_RANGE,
                  atk_range=DEFAULT_ATK_RANGE):
         super().__init__()
         self.render_mode = render_mode
@@ -546,6 +570,10 @@ class SealSlammersEnv(gym.Env):
         self.window_surface = None
         self.clock = None
         
+        # If we started in human mode (Game opened a display), count this env
+        if self.render_mode == 'human':
+            SealSlammersEnv._active_display_envs += 1
+        
         self.num_objects_per_player = num_objects_per_player
 
         # Store fixed HP/ATK values and ranges
@@ -558,15 +586,17 @@ class SealSlammersEnv(gym.Env):
         
         self.last_opponent_action = [-1.0, -1.0, -1.0] 
         self.consecutive_meaningless_actions = 0
+        # NEW: shaping scale (1.0 full shaping -> decays later via callback)
+        self.shaping_scale = 1.0
 
-        # Action space: 减少动作空间复杂度
+        # Action space: 统一为 72 个方向、5 档力度
         # action[0]: object_to_move (0 to num_objects_per_player - 1)
-        # action[1]: angle_idx (0 to 35 for 36 directions) - 减少到36个方向
-        # action[2]: strength_idx (0 to 2 for 3 levels) - 减少到3个力度等级
+        # action[1]: angle_idx (0 to 71 for 72 directions)
+        # action[2]: strength_idx (0 to 4 for 5 levels)
         self.action_space = spaces.MultiDiscrete([
-            num_objects_per_player, 
-            36,                     # 从72减少到36
-            3                       # 从5减少到3
+            num_objects_per_player,
+            72,                     # 72 directions
+            5                       # 5 strength levels
         ])
 
         # Observation space:
@@ -582,9 +612,9 @@ class SealSlammersEnv(gym.Env):
         #   - Player 0 score (raw) (game.scores[0]) (1 feature)
         #   - Player 1 score (raw) (game.scores[1]) (1 feature)
         # Last opponent action features:
-        #   - Opponent\'s chosen object index (1 feature)
-        #   - Opponent\'s chosen angle index (1 feature)
-        #   - Opponent\'s chosen strength index (1 feature)
+        #   - Opponent's chosen object index (1 feature)
+        #   - Opponent's chosen angle index (1 feature)
+        #   - Opponent's chosen strength index (1 feature)
         # Total features = (num_objects_per_player * 2 * 5) + 1 + 2 + 3
         obs_dim = (num_objects_per_player * 2 * 5) + 1 + 2 + 3
 
@@ -634,8 +664,8 @@ class SealSlammersEnv(gym.Env):
         # 上一个对手动作 (归一化)
         norm_last_action = [
             self.last_opponent_action[0] / self.num_objects_per_player,  # 对象索引
-            self.last_opponent_action[1] / 36.0,  # 角度索引 (更新为36)
-            self.last_opponent_action[2] / 3.0    # 力度索引 (更新为3)
+            self.last_opponent_action[1] / 72.0,  # 角度索引 (72)
+            self.last_opponent_action[2] / 5.0    # 力度索引 (5)
         ]
         state.extend(norm_last_action)
 
@@ -665,6 +695,9 @@ class SealSlammersEnv(gym.Env):
         # 在 reset 方法中调用 get_info() 以确保初始状态也包含动作掩码
         info = self.get_info() 
         
+        # Initialize episode component tracker
+        self._episode_components = {}
+
         if self.render_mode == "human":
             self.render()
         return observation, info
@@ -697,7 +730,7 @@ class SealSlammersEnv(gym.Env):
             strength_mask = np.full(self.action_space.nvec[2], any(object_mask_list), dtype=bool)
             
             # 对于MultiDiscrete，掩码应该是各个子动作空间掩码的连接
-            # 总长度 = sum(nvec) = 3 + 36 + 3 = 42
+            # 总长度 = sum(nvec) = 3 + 72 + 5 = 80
             concatenated_mask = np.concatenate([object_mask, angle_mask, strength_mask])
             
             return concatenated_mask
@@ -723,9 +756,6 @@ class SealSlammersEnv(gym.Env):
                 "action_mask": action_masks_flat,
                 "scores": [self.game.scores[0], self.game.scores[1]], # 包含当前分数
                 "winner": self.game.winner if hasattr(self.game, 'winner') else None, # 包含胜利者信息
-                # 您可以根据需要添加其他调试信息
-                # "can_player_move": self.game.can_player_move(current_player_id),
-                # "current_player_turn_in_info": current_player_id
             }
         except Exception as e:
             print(f"ERROR IN SealSlammersEnv.get_info(): {e}")
@@ -741,89 +771,123 @@ class SealSlammersEnv(gym.Env):
                 "error_in_get_info": str(e) # 标记错误发生
             }
 
-    def _calculate_reward(self, initial_scores, initial_hp_states, selected_obj, terminated, current_player_id):
-        """
-        Calculates the reward for the current step.
-        """
-        reward = 0.0
-        score_diff_p_current = self.game.scores[current_player_id] - initial_scores[current_player_id]
+    # NEW: allow external callback to adjust shaping scale
+    def set_shaping_scale(self, scale: float):
+        self.shaping_scale = float(max(0.0, min(scale, 1.0)))
+
+    def _calculate_reward(self, initial_scores, initial_hp_states, selected_obj, terminated, current_player_id,
+                          collision_happened: bool = False,
+                          dist_before: float | None = None,
+                          dist_after: float | None = None,
+                          alignment_score: float = 0.0):
+        # Core variables
         opponent_player_id = 1 - current_player_id
+        score_diff_p_current = self.game.scores[current_player_id] - initial_scores[current_player_id]
         initial_opponent_score = initial_scores[opponent_player_id]
         current_opponent_score = self.game.scores[opponent_player_id]
+        scale = getattr(self, 'shaping_scale', 1.0)
 
-        # Reward for increasing own score (typically by KOing an opponent)
-        reward += score_diff_p_current * 100.0  # 增加得分奖励
+        # Initialize component values
+        ko_points = 0.0
+        win_bonus = 0.0
+        loss_penalty = 0.0
+        invalid_penalty = 0.0
+        selection_reward = 0.0
+        damage_base_reward = 0.0
+        tier_bonus = 0.0
+        meaningless_penalty = 0.0
+        collision_reward = 0.0
+        dist_reward = 0.0
+        alignment_reward = 0.0
+        position_reward = 0.0
+        time_penalty = 0.0
 
-        if not selected_obj: # Penalty for invalid action (e.g., chose KO'd object, out of bounds)
-            reward -= 50.0  # 大幅减少无效动作惩罚
-        else: # Valid object was selected
-            # 给予选择有效对象的小幅奖励
-            reward += 1.0
-            
-            # --- Reward for damaging an opponent (Tiered based on damage relative to attacker's ATK) ---
-            any_damage_dealt_to_opponent = False
-            total_damage_dealt_to_opponent_hp = 0 # Tracks total HP damage dealt
-            
-            # Get the attack power of the selected object (attacker)
-            attacker_atk = selected_obj.attack if selected_obj else OBJECT_DEFAULT_ATTACK
+        if score_diff_p_current > 0:
+            ko_points = score_diff_p_current * KO_POINT_REWARD
 
-            if initial_hp_states: 
-                for obj_idx, hp_before_action in enumerate(initial_hp_states[opponent_player_id]):
-                    if obj_idx < len(self.game.players_objects[opponent_player_id]): 
-                        obj_after_action = self.game.players_objects[opponent_player_id][obj_idx]
-                        hp_after_action = obj_after_action.hp
-                        damage_dealt_to_this_obj = hp_before_action - hp_after_action
-                        
-                        if damage_dealt_to_this_obj > 0:
-                            total_damage_dealt_to_opponent_hp += damage_dealt_to_this_obj
-                            any_damage_dealt_to_opponent = True
+        any_damage = False
+        total_damage = 0.0
+        attacker_atk = selected_obj.attack if selected_obj else OBJECT_DEFAULT_ATTACK
 
-            # Base reward for any damage
-            if any_damage_dealt_to_opponent:
-                reward += total_damage_dealt_to_opponent_hp * 2.0 # 增加伤害奖励
-
-                # Tiered bonus based on total damage dealt
+        if not selected_obj:
+            invalid_penalty = INVALID_ACTION_PENALTY
+        else:
+            selection_reward = SELECTION_SHAPING_REWARD * scale
+            if initial_hp_states:
+                for idx, hp_before in enumerate(initial_hp_states[opponent_player_id]):
+                    if idx < len(self.game.players_objects[opponent_player_id]):
+                        hp_after = self.game.players_objects[opponent_player_id][idx].hp
+                        d = hp_before - hp_after
+                        if d > 0:
+                            total_damage += d
+                            any_damage = True
+            if any_damage:
+                damage_base_reward = total_damage * DAMAGE_BASE_PER_HP
                 if attacker_atk > 0:
-                    if total_damage_dealt_to_opponent_hp >= attacker_atk * 3:
-                        reward += total_damage_dealt_to_opponent_hp * 5.0  # 减少最高奖励
-                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 2:
-                        reward += total_damage_dealt_to_opponent_hp * 3.0  
-                    elif total_damage_dealt_to_opponent_hp >= attacker_atk * 1:
-                        reward += total_damage_dealt_to_opponent_hp * 1.5   
-            
-            # --- 简化"无意义"动作的惩罚 ---
-            if score_diff_p_current == 0 and \
-               (current_opponent_score - initial_opponent_score) == 0 and \
-               not any_damage_dealt_to_opponent:
+                    if total_damage >= attacker_atk * 3:
+                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[3]
+                    elif total_damage >= attacker_atk * 2:
+                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[2]
+                    elif total_damage >= attacker_atk * 1:
+                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[1]
+            if score_diff_p_current == 0 and (current_opponent_score - initial_opponent_score) == 0 and not any_damage:
                 self.consecutive_meaningless_actions += 1
-                # 减少惩罚强度
-                reward -= min(5.0 + (self.consecutive_meaningless_actions -1) * 2.0, 20.0) # 最大惩罚20
+                base_penalty = min(3.0 + (self.consecutive_meaningless_actions - 1) * 1.0, 10.0)
+                meaningless_penalty = base_penalty * scale
             else:
-                # If the action was meaningful, reset the counter
                 self.consecutive_meaningless_actions = 0
+            if collision_happened and not any_damage:
+                collision_reward = COLLISION_SHAPING_REWARD * scale
+            if dist_before is not None and dist_after is not None and dist_after < dist_before:
+                delta = dist_before - dist_after
+                dist_reward = min(delta / 80.0, DIST_REDUCTION_MAX_SHAPING) * scale
+            if alignment_score > 0:
+                alignment_reward = min(alignment_score, 1.0) * ALIGNMENT_MAX_SHAPING * scale
 
-        # --- 简化位置奖励 ---
         if selected_obj and not terminated:
-            # 给予简单的移动奖励，鼓励探索
-            reward += 0.5
+            position_reward = POSITION_SHAPING_REWARD * scale
 
         if terminated:
             if self.game.winner == current_player_id:
-                reward += 200.0  # 减少胜利奖励
+                win_bonus = WIN_REWARD
             elif self.game.winner == opponent_player_id:
-                reward -= 200.0  # 减少失败惩罚
+                loss_penalty = -abs(LOSS_PENALTY)  # ensure negative
         else:
-            # --- 减少时间惩罚 ---
-            reward -= 0.1 # 更小的时间惩罚
+            time_penalty = TIME_STEP_PENALTY
 
-        return reward
+        reward = (ko_points + win_bonus + loss_penalty + invalid_penalty + selection_reward + damage_base_reward +
+                  tier_bonus - meaningless_penalty + collision_reward + dist_reward + alignment_reward +
+                  position_reward + time_penalty)
 
+        components = {
+            'ko_points': ko_points,
+            'win_bonus': win_bonus,
+            'loss_penalty': loss_penalty,
+            'invalid_penalty': invalid_penalty,
+            'selection_reward': selection_reward,
+            'damage_base': damage_base_reward,
+            'tier_bonus': tier_bonus,
+            'meaningless_penalty': meaningless_penalty,
+            'collision_reward': collision_reward,
+            'dist_reward': dist_reward,
+            'alignment_reward': alignment_reward,
+            'position_reward': position_reward,
+            'time_penalty': time_penalty,
+            'total_reward': reward
+        }
+
+        return reward, components
+
+# --- Game loop and logic (unchanged) ---
     def step(self, action):
         # The 'action' parameter is the action taken by the current_player_id
         # This action will become the 'last_opponent_action' for the *next* player's observation
         
         object_idx, angle_idx, strength_idx = action
         current_player_id = self.game.current_player_turn
+
+        # Reset collision flag for this action
+        self.game.enemy_collision_happened_this_step = False
 
         # ADDED: Check if the agent is attempting to select an object that has already moved this turn.
         attempted_to_select_moved_object = False
@@ -846,45 +910,60 @@ class SealSlammersEnv(gym.Env):
         for p_objs in self.game.players_objects:
             initial_hp_states.append([obj.hp for obj in p_objs])
 
+        # NEW: precompute nearest opponent distance and alignment before launch
+        dist_before = None
+        alignment_score = 0.0
+
         if selected_obj:
-            pull_angle_rad = (angle_idx / 36.0) * 2 * math.pi  # 更新角度计算 (现在是36个方向)
+            # Find nearest opponent BEFORE applying force
+            opponent_objs_alive = [o for o in self.game.players_objects[1 - current_player_id] if o.hp > 0]
+            if opponent_objs_alive:
+                # Distance before
+                dists = [math.hypot(selected_obj.x - o.x, selected_obj.y - o.y) for o in opponent_objs_alive]
+                nearest_idx = int(np.argmin(dists))
+                dist_before = dists[nearest_idx]
+                target_opp = opponent_objs_alive[nearest_idx]
+            else:
+                target_opp = None
+
+        if selected_obj:
+            pull_angle_rad = (angle_idx / 72.0) * 2 * math.pi  # 72 个方向
             launch_angle_rad = pull_angle_rad + math.pi  # Launch is opposite to pull
+
+            # Compute alignment_score (0..1) toward nearest opponent at launch time
+            if 'target_opp' in locals() and target_opp is not None:
+                launch_dir = np.array([math.cos(launch_angle_rad), math.sin(launch_angle_rad)], dtype=float)
+                to_opp_vec = np.array([target_opp.x - selected_obj.x, target_opp.y - selected_obj.y], dtype=float)
+                to_opp_norm = np.linalg.norm(to_opp_vec)
+                if to_opp_norm > 1e-6:
+                    to_opp_unit = to_opp_vec / to_opp_norm
+                    cos_sim = float(np.clip(np.dot(launch_dir, to_opp_unit), -1.0, 1.0))
+                    alignment_score = max(cos_sim, 0.0)  # Only reward when pointing roughly toward opponent
 
             # ADDED: Set the object's angle based on the RL agent's chosen launch direction.
             selected_obj.angle = launch_angle_rad
 
-            strength_scale = (strength_idx + 1) / 3.0  # 更新力度计算: 0 to 2 -> 0.33 to 1.0
+            strength_scale = (strength_idx + 1) / 5.0  # 5 档力度: 0..4 -> 0.2..1.0
             actual_strength_magnitude = strength_scale * MAX_LAUNCH_STRENGTH_RL
 
-            # launch_vx, launch_vy is the desired velocity of the object in the launch direction
             launch_vx = math.cos(launch_angle_rad) * actual_strength_magnitude
             launch_vy = math.sin(launch_angle_rad) * actual_strength_magnitude
-            
-            # GameObject.apply_force expects dx, dy to be "pull vector components"
-            # To achieve launch_vx, launch_vy, the effective "pull vector" (dx_param, dy_param)
-            # passed to apply_force should be such that:
-            # launch_vx = -dx_param * FORCE_MULTIPLIER  (since apply_force does self.vx = -dx * multiplier)
-            # launch_vy = -dy_param * FORCE_MULTIPLIER
-            # So, dx_param = -launch_vx / FORCE_MULTIPLIER
-            # and dy_param = -launch_vy / FORCE_MULTIPLIER
-            # These dx_param, dy_param will be in the original pull direction.
-            if FORCE_MULTIPLIER == 0: # Avoid division by zero
+
+            if FORCE_MULTIPLIER == 0:
                 dx_to_pass_to_apply_force = 0
                 dy_to_pass_to_apply_force = 0
             else:
+                # Convert desired launch velocity back to pull vector with unified multiplier
                 dx_to_pass_to_apply_force = -launch_vx / FORCE_MULTIPLIER
                 dy_to_pass_to_apply_force = -launch_vy / FORCE_MULTIPLIER
-            
-            selected_obj.apply_force(dx_to_pass_to_apply_force, dy_to_pass_to_apply_force)
+            selected_obj.apply_force(dx_to_pass_to_apply_force, dy_to_pass_to_apply_force, strength_multiplier=FORCE_MULTIPLIER)
             self.game.action_processing_pending = True
-            # Record the valid action taken by the current player
             action_taken_by_current_player = [float(object_idx), float(angle_idx), float(strength_idx)]
         else:
             # Invalid action (e.g., chose KO'd object or bad index)
             # No game object moves, effectively a pass or lost turn.
             # Physics simulation will run but likely nothing happens from player action.
             self.game.action_processing_pending = True # Still need to run simulation loop once.
-            # Record the invalid action attempted by the current player
             action_taken_by_current_player = [float(object_idx), float(angle_idx), float(strength_idx)]
 
         # Simulate game until objects stop moving or max steps for this turn
@@ -908,18 +987,30 @@ class SealSlammersEnv(gym.Env):
             if self.game.game_over: # If game ends mid-action simulation
                 break
         
-        self.game.action_processing_pending = False # Ensure it\'s false after loop
+        self.game.action_processing_pending = False # Ensure it's false after loop
 
         terminated = self.game.game_over
         
-        # Calculate reward using the new dedicated function
-        reward = self._calculate_reward(initial_scores, initial_hp_states, selected_obj, terminated, current_player_id)
+        # NEW: compute post-simulation distance to nearest opponent for shaping
+        dist_after = None
+        if selected_obj:
+            opponent_objs_alive_after = [o for o in self.game.players_objects[1 - current_player_id] if o.hp > 0]
+            if opponent_objs_alive_after:
+                dists_after = [math.hypot(selected_obj.x - o.x, selected_obj.y - o.y) for o in opponent_objs_alive_after]
+                dist_after = min(dists_after)
+
+        # Calculate reward using the new dedicated function (with shaping signals)
+        reward, components = self._calculate_reward(
+            initial_scores, initial_hp_states, selected_obj, terminated, current_player_id,
+            collision_happened=self.game.enemy_collision_happened_this_step,
+            dist_before=dist_before, dist_after=dist_after,
+            alignment_score=alignment_score
+        )
         
         # ADDED: Apply the specific, additional penalty if an already moved object was selected.
-        # This stacks on top of the -50 penalty from _calculate_reward (because selected_obj would be None).
         if attempted_to_select_moved_object:
             reward -= 10.0  # 大幅减少惩罚，从250降到10
-            
+
         # Respawn KO\'d objects before turn progression (if game not over)
         if not terminated:
             for player_list_idx, player_objs in enumerate(self.game.players_objects): # Use enumerate if idx needed
@@ -968,9 +1059,19 @@ class SealSlammersEnv(gym.Env):
         self.last_opponent_action = action_taken_by_current_player
         
         observation = self._get_obs()
-        # 在 step 方法中调用 get_info() 以获取新状态的动作掩码
         info = self.get_info() 
         truncated = (frames_this_step >= MAX_FRAMES_PER_ACTION_STEP) and not terminated
+
+        # --- Per-episode component accumulation ---
+        if not hasattr(self, '_episode_components'):
+            self._episode_components = {k: 0.0 for k in components.keys()}
+        for k, v in components.items():
+            self._episode_components[k] = self._episode_components.get(k, 0.0) + float(v)
+        if terminated or truncated:
+            # Provide cumulative components for the finished episode
+            info['episode_reward_components'] = self._episode_components.copy()
+            # Reset for next episode start (will also be reinitialized on env.reset())
+            self._episode_components = {k: 0.0 for k in components.keys()}
 
         if self.render_mode == "human":
             self.render()
@@ -1028,16 +1129,31 @@ class SealSlammersEnv(gym.Env):
 
 
     def close(self):
-        if self.window_surface is not None:
-            pygame.display.quit()
-            self.window_surface = None
-        # Pygame quit should ideally be called when the application is fully closing,
-        # not necessarily when one env instance is closed, if other pygame stuff is running.
-        # However, if this env is the main user of pygame display, it's fine.
-        # For safety, let's assume we only quit display here.
-        # If pygame.get_init() and no other modules depend on it, pygame.quit() could be called.
-        # pygame.quit() # This uninitializes all pygame modules.
-        pass # Avoid global pygame.quit() for now.
+        """Close the environment's display resources safely.
+        If this is the last human-render environment, fully quit pygame to release all resources.
+        """
+        # Only decrement if this env was using a human display
+        if self.render_mode == 'human':
+            if SealSlammersEnv._active_display_envs > 0:
+                SealSlammersEnv._active_display_envs -= 1
+            # If this was the last active display env, quit pygame fully
+            if SealSlammersEnv._active_display_envs == 0 and pygame.get_init():
+                try:
+                    pygame.quit()
+                except Exception as e:
+                    print(f"SealSlammersEnv.close(): Exception during pygame.quit(): {e}")
+            else:
+                # If others still exist, just ensure this env's display surface reference is cleared
+                if pygame.display.get_init():
+                    try:
+                        pygame.display.quit()
+                    except Exception:
+                        pass
+        # Clear references
+        self.window_surface = None
+        # Prevent double-closing logic on repeated calls
+        self.render_mode = None
+        return
 
 # Example of how to register (optional, can be done elsewhere)
 # from gymnasium.envs.registration import register
