@@ -1,51 +1,43 @@
-import os # Added
+import os  # Added
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
 import math
-import random # Ensure random is imported
+import random  # Ensure random is imported
 from rl_seal_slammers.physics_utils import simulate_projected_path  # Shared trajectory prediction
-
-# --- Constants ---
-SCREEN_WIDTH = 1000
-SCREEN_HEIGHT = 600
-FPS = 60
-
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-RED = (255, 0, 0)
-BLUE = (0, 0, 255)
-GREEN = (0, 255, 0)
-GREY = (128, 128, 128)
-LIGHT_GREY = (200, 200, 200) # Used as background in main.py draw
-
-OBJECT_RADIUS = 23 # Updated from main.py
-OBJECT_DEFAULT_HP = 40    # Default HP if not randomized/specified
-OBJECT_DEFAULT_ATTACK = 8 # Default Attack if not randomized/specified
-
-NUM_OBJECTS_PER_PLAYER = 3 # Added definition
-INITIAL_HP = 40
-INITIAL_ATTACK = 8
-
-# --- Default HP/Attack Ranges for Randomization ---
-DEFAULT_HP_RANGE = (35, 50)
-DEFAULT_ATK_RANGE = (7, 10)
-
-MAX_PULL_RADIUS_MULTIPLIER = 4.0 # Added from main.py logic
-
-# Compute RL max launch strength to mirror main game's max drag distance * FORCE_MULTIPLIER
-FORCE_MULTIPLIER = 0.08 * 4  # Keep identical to main.py apply_force
-MAX_LAUNCH_STRENGTH_RL = OBJECT_RADIUS * MAX_PULL_RADIUS_MULTIPLIER * FORCE_MULTIPLIER  # 23*4*0.32 = 29.44
-FRICTION = 0.98
-MIN_SPEED_THRESHOLD = 0.1  # (Retained for other logic; not used in move stop now)
-ELASTICITY = 1.0
-
-MAX_VICTORY_POINTS = 5
-DAMAGE_COOLDOWN_FRAMES = 10 # From main.py
-
-HP_BAR_WIDTH = 40
-HP_BAR_HEIGHT = 5
+from .game_core import (
+    Game,
+    GameObject,
+    SCREEN_WIDTH,
+    SCREEN_HEIGHT,
+    FPS,
+    BLACK,
+    WHITE,
+    RED,
+    BLUE,
+    GREEN,
+    GREY,
+    LIGHT_GREY,
+    OBJECT_RADIUS,
+    OBJECT_DEFAULT_HP,
+    OBJECT_DEFAULT_ATTACK,
+    NUM_OBJECTS_PER_PLAYER,
+    INITIAL_HP,
+    INITIAL_ATTACK,
+    DEFAULT_HP_RANGE,
+    DEFAULT_ATK_RANGE,
+    MAX_PULL_RADIUS_MULTIPLIER,
+    FORCE_MULTIPLIER,
+    MAX_LAUNCH_STRENGTH_RL,
+    FRICTION,
+    MIN_SPEED_THRESHOLD,
+    ELASTICITY,
+    MAX_VICTORY_POINTS,
+    DAMAGE_COOLDOWN_FRAMES,
+    HP_BAR_WIDTH,
+    HP_BAR_HEIGHT,
+)
 
 # --- Reward scaling constants (normalized magnitudes) ---
 KO_POINT_REWARD = 30.0           # per score point gained
@@ -54,8 +46,10 @@ LOSS_PENALTY = -80.0
 INVALID_ACTION_PENALTY = -15.0
 SELECTION_SHAPING_REWARD = 0.5   # scaled by shaping_scale
 POSITION_SHAPING_REWARD = 0.2    # scaled by shaping_scale
-COLLISION_SHAPING_REWARD = 1.5   # scaled by shaping_scale (no damage)
-DIST_REDUCTION_MAX_SHAPING = 2.5 # cap for distance shaping per action (scaled)
+# Adjusted: encourage contact slightly more
+COLLISION_SHAPING_REWARD = 2.0   # scaled by shaping_scale (no damage)
+# Adjusted distance shaping cap
+DIST_REDUCTION_MAX_SHAPING = 3.0 # cap for distance shaping per action (scaled)
 ALIGNMENT_MAX_SHAPING = 0.5      # scaled by shaping_scale
 DAMAGE_BASE_PER_HP = 1.0         # core signal (unscaled)
 # Tier multipliers relative to attacker_atk thresholds (unscaled core bonuses)
@@ -65,487 +59,13 @@ DAMAGE_TIER_MULTIPLIERS = {
     3: 3.0    # >= 3 * atk
 }
 TIME_STEP_PENALTY = -0.05        # lighter time penalty
-
-# --- GameObject Class (Copied from main.py and adapted) ---
-class GameObject:
-    def __init__(self, x, y, radius, color, hp, attack, player_id, object_id, mass=6.0): # Updated mass from main.py
-        self.x = float(x)
-        self.y = float(y)
-        self.radius = radius
-        self.color = color
-        self.initial_hp = hp
-        self.hp = float(hp)
-        self.attack = attack
-        self.player_id = player_id
-        self.object_id = object_id
-
-        self.vx = 0.0
-        self.vy = 0.0
-        self.is_moving = False
-        self.has_moved_this_turn = False
-        self.original_x = float(x)
-        self.original_y = float(y)
-        self.mass = mass
-        self.restitution = ELASTICITY
-        # Add moment_of_inertia for parity (not currently used elsewhere)
-        self.moment_of_inertia = 0.5 * self.mass * (self.radius ** 2)
-
-        # Attributes from main.py's GameObject
-        self.angle = 0.0 # For potential drawing or physics extensions
-        self.angular_velocity = 0.0 # For potential physics extensions
-        self.last_damaged_frame = - DAMAGE_COOLDOWN_FRAMES * 2 # Initialize to allow immediate damage
-        self.damage_intake_cooldown_frames = DAMAGE_COOLDOWN_FRAMES
-        
-
-    def apply_force(self, dx, dy, strength_multiplier=0.08 * 4):  # Match main.py constant directly
-        self.vx = -dx * strength_multiplier
-        self.vy = -dy * strength_multiplier
-        self.is_moving = True
-        self.has_moved_this_turn = True
-
-    def move(self):  # Match main.py friction & stop condition
-        if self.is_moving:
-            self.x += self.vx
-            self.y += self.vy
-            # Linear friction identical to main.py
-            self.vx *= 0.98
-            self.vy *= 0.98
-            # Stop condition uses component-wise thresholds like main.py
-            if abs(self.vx) < 0.1 and abs(self.vy) < 0.1:
-                self.vx = 0
-                self.vy = 0
-                self.is_moving = False
-        # Angle update & angular damping (extra, acceptable; keep)
-        self.angle += self.angular_velocity
-        self.angular_velocity *= 0.97
-
-    def check_boundary_collision(self, screen_width, screen_height):  # Remove extra bottom damping to mirror main.py
-        if self.x - self.radius < 0:
-            self.x = self.radius
-            self.vx *= -self.restitution
-        elif self.x + self.radius > screen_width:
-            self.x = screen_width - self.radius
-            self.vx *= -self.restitution
-        if self.y - self.radius < 0:
-            self.y = self.radius
-            self.vy *= -self.restitution
-        elif self.y + self.radius > screen_height:
-            self.y = screen_height - self.radius
-            self.vy *= -self.restitution
-
-
-    def take_damage(self, amount, current_game_frame):
-        if current_game_frame - self.last_damaged_frame < self.damage_intake_cooldown_frames:
-            return False # In cooldown
-        self.hp -= amount
-        self.last_damaged_frame = current_game_frame
-        if self.hp < 0:
-            self.hp = 0
-        return True # Damage applied
-
-    def respawn(self, new_x=None, new_y=None): # Modified to accept new_x, new_y
-        self.hp = self.initial_hp
-        self.x = new_x if new_x is not None else self.original_x # Use new position if provided
-        self.y = new_y if new_y is not None else self.original_y # Use new position if provided
-        self.vx = 0.0
-        self.vy = 0.0
-        self.is_moving = False
-        # self.has_moved_this_turn = False # Reset by next_round or turn logic, not individually here
-        self.angle = 0.0
-        self.angular_velocity = 0.0
-        self.last_damaged_frame = - DAMAGE_COOLDOWN_FRAMES * 2
-
-
-    def draw(self, surface, font_small, font_hp_atk): # Added font_hp_atk
-        if self.hp <= 0: # If HP is 0 or less, do not draw the object
-            return       # This makes it disappear
-
-        # Draw circle (same as main.py)
-        pygame.draw.circle(surface, self.color, (int(self.x), int(self.y)), self.radius)
-        
-        # Draw HP and ATK text (like in main.py)
-        if self.hp > 0 : # Only draw if alive
-            hp_text_surface = font_hp_atk.render(f"HP: {self.hp:.0f}", True, BLACK)
-            atk_text_surface = font_hp_atk.render(f"ATK: {self.attack}", True, BLACK)
-            spacing = 5
-            total_text_block_width = hp_text_surface.get_width() + spacing + atk_text_surface.get_width()
-            hp_start_x = self.x - total_text_block_width / 2
-            atk_start_x = hp_start_x + hp_text_surface.get_width() + spacing
-            text_y_pos = self.y + self.radius + 5
-            surface.blit(hp_text_surface, (hp_start_x, text_y_pos))
-            surface.blit(atk_text_surface, (atk_start_x, text_y_pos))
-
-            # Draw direction indicator (like in main.py)
-            # Angle for RL agent might be set differently or not used for this visual
-            # For now, let's assume self.angle might be updated by RL logic if needed for visuals
-            line_end_x = self.x + self.radius * math.cos(self.angle)
-            line_end_y = self.y + self.radius * math.sin(self.angle)
-            pygame.draw.line(surface, BLACK, (self.x, self.y), (line_end_x, line_end_y), 2)
-
-        if self.has_moved_this_turn: # Highlight if moved (like in main.py) - Removed 'and self.hp > 0' for consistency
-            pygame.draw.circle(surface, GREEN, (int(self.x), int(self.y)), self.radius + 3, 2)
-        
-        # Draw object ID (from original env.py, useful for RL debugging)
-        id_text_surface = font_small.render(f"{self.object_id+1}", True, BLACK if self.hp > 0 else GREY)
-        text_rect = id_text_surface.get_rect(center=(self.x, self.y if self.hp > 0 else self.original_y)) # Show ID at original spot if KO'd
-        surface.blit(id_text_surface, text_rect)
-
-
-# --- Game Class (Copied from main.py and adapted for RL Env) ---
-class Game:
-    def __init__(
-        self, headless=False, num_objects_per_player=NUM_OBJECTS_PER_PLAYER): # Removed HP/ATK params
-        if not pygame.get_init() and not headless:
-            pygame.init()
-        if not pygame.font.get_init() and not headless:
-            pygame.font.init()
-            
-        self.headless_mode = headless
-        self.screen = None
-        if not self.headless_mode:
-            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-            pygame.display.set_caption("Seal Slammers - Game Instance")
-            self.font = pygame.font.SysFont(None, 30)
-            self.font_small = pygame.font.SysFont(None, 18) # For object IDs
-            self.font_hp_atk = pygame.font.SysFont(None, 18) # For HP/ATK text like in main.py
-            self.clock = pygame.time.Clock()
-        else: # Headless or for rgb_array
-            # Initialize fonts even in headless mode for potential rgb_array rendering
-            if not pygame.get_init(): pygame.init() # Pygame needs to be init for fonts
-            if not pygame.font.get_init(): pygame.font.init()
-            self.font = pygame.font.SysFont(None, 30) 
-            self.font_small = pygame.font.SysFont(None, 18)
-            self.font_hp_atk = pygame.font.SysFont(None, 18)
-            self.screen = None 
-            self.clock = None # Clock not typically used in headless RL steps unless for FPS matching
-
-        self.num_objects_per_player = num_objects_per_player
-        # Removed self.pX_initial_hp and self.pX_initial_atk attributes
-
-        self.players_objects: list[list[GameObject]] = []
-        self.scores = [0, 0]
-        self.current_player_turn = 0
-        self.game_over = False
-        self.winner = None
-        self.action_processing_pending = False # True after a launch, until objects stop
-        self.frame_count = 0
-        self.first_player_of_round = 0 # To manage who starts a new round/exchange
-        
-        # Constants for respawn logic
-        self._RESPAWN_SEARCH_STEP_DISTANCE_FACTOR = 0.75 # Factor of object radius
-        self._RESPAWN_MAX_SPIRAL_LAYERS = 8
-        self._RESPAWN_POINTS_PER_LAYER = 8
-
-        # NEW: flag to indicate whether any cross-team collision happened during the latest action simulation
-        self.enemy_collision_happened_this_step = False
-
-        # Call reset_game_state with default HP/Attack values
-        self.reset_game_state(p0_hp=INITIAL_HP, p0_atk=INITIAL_ATTACK, 
-                              p1_hp=INITIAL_HP, p1_atk=INITIAL_ATTACK)
-
-    def reset_game_state(self, p0_hp, p0_atk, p1_hp, p1_atk): # Added HP/ATK params
-        self.players_objects = [[], []]
-        self.scores = [0, 0]
-        self.current_player_turn = 0  # Player 0 starts
-        self.game_over = False
-        self.winner = None
-        self.action_processing_pending = False # True if an action has been taken and physics sim is ongoing
-
-        # Initial positions for player 0 (left side, vertical)
-        x_padding_p0 = 50 + OBJECT_RADIUS
-        for i in range(self.num_objects_per_player):
-            x = x_padding_p0
-            y = SCREEN_HEIGHT // (self.num_objects_per_player + 1) * (i + 1)
-            # Create GameObject without 'angle' in constructor
-            obj = GameObject(x, y, OBJECT_RADIUS, BLUE, player_id=0, object_id=i,
-                             hp=p0_hp, attack=p0_atk)
-            obj.angle = 0 # Facing right
-            self.players_objects[0].append(obj)
-
-        # Initial positions for player 1 (right side, vertical)
-        x_padding_p1 = SCREEN_WIDTH - 50 - OBJECT_RADIUS
-        for i in range(self.num_objects_per_player):
-            x = x_padding_p1
-            y = SCREEN_HEIGHT // (self.num_objects_per_player + 1) * (i + 1)
-            # Create GameObject without 'angle' in constructor
-            obj = GameObject(x, y, OBJECT_RADIUS, RED, player_id=1, object_id=i,
-                             hp=p1_hp, attack=p1_atk)
-            obj.angle = math.pi # Facing left
-            self.players_objects[1].append(obj)
-        
-        for p_objs in self.players_objects:
-            for obj_k in p_objs:
-                obj_k.has_moved_this_turn = False
-    
-
-    def all_objects_stopped(self): # Added from main.py
-        for player_objs in self.players_objects:
-            for obj in player_objs:
-                if obj.is_moving:
-                    return False
-        return True
-
-    def can_player_move(self, player_id: int) -> bool: # Added from main.py
-        """Checks if the specified player has any units that can still move."""
-        for obj in self.players_objects[player_id]:
-            if obj.hp > 0 and not obj.has_moved_this_turn:
-                return True
-        return False
-
-    def object_has_moved_this_turn(self, player_id: int, object_idx_in_player_list: int) -> bool:
-        if 0 <= player_id < len(self.players_objects) and \
-           0 <= object_idx_in_player_list < len(self.players_objects[player_id]):
-            return self.players_objects[player_id][object_idx_in_player_list].has_moved_this_turn
-        # If indices are out of bounds, or object doesn't exist,
-        # consider it as "cannot be moved" or "has effectively moved / is not available".
-        # This prevents errors if play.py tries to check an invalid index.
-        return True
-
-
-    def next_round(self): # Added from main.py
-        # print("DEBUG ENV: Round ended, switching first player for next round.")
-        self.first_player_of_round = 1 - self.first_player_of_round
-        self.current_player_turn = self.first_player_of_round
-        for player_objs in self.players_objects:
-            for obj in player_objs:
-                obj.has_moved_this_turn = False # Reset all units' move status
-        # print(f"DEBUG ENV: Next round. Player {self.current_player_turn + 1} starts.")
-
-
-    def _check_overlap_at_pos(self, x, y, radius, object_to_exclude=None):
-        """Checks if an object at (x,y) with radius would overlap with other active objects."""
-        for player_list in self.players_objects:
-            for other_obj in player_list:
-                if other_obj is object_to_exclude or other_obj.hp <= 0:
-                    continue # Don't check against self or KO'd objects
-
-                dist_sq = (x - other_obj.x)**2 + (y - other_obj.y)**2
-                min_dist_sq = (radius + other_obj.radius)**2
-                if dist_sq < min_dist_sq - 1e-6: # Added tolerance for floating point
-                    return True # Overlap detected
-        return False # No overlap
-
-    def _find_non_overlapping_spawn_position(self, object_being_respawned, preferred_x, preferred_y):
-        """
-        Finds a non-overlapping position for the object_being_respawned,
-        starting from preferred_x, preferred_y and searching outwards if needed.
-        """
-        obj_radius = object_being_respawned.radius
-
-        # Try preferred position first
-        if not self._check_overlap_at_pos(preferred_x, preferred_y, obj_radius, object_being_respawned):
-            return preferred_x, preferred_y
-
-        # Spiral search outwards
-        search_step_distance = obj_radius * self._RESPAWN_SEARCH_STEP_DISTANCE_FACTOR
-
-        for layer in range(1, self._RESPAWN_MAX_SPIRAL_LAYERS + 1):
-            current_search_dist = layer * search_step_distance
-            for i in range(self._RESPAWN_POINTS_PER_LAYER):
-                # Add a slight angle offset for each layer to ensure points don't always align
-                angle_offset = (math.pi / self._RESPAWN_POINTS_PER_LAYER) * (layer % 2) 
-                angle = (2 * math.pi / self._RESPAWN_POINTS_PER_LAYER) * i + angle_offset
-                
-                candidate_x = preferred_x + current_search_dist * math.cos(angle)
-                candidate_y = preferred_y + current_search_dist * math.sin(angle)
-
-                # Clamp to screen boundaries
-                candidate_x = max(obj_radius, min(candidate_x, SCREEN_WIDTH - obj_radius))
-                candidate_y = max(obj_radius, min(candidate_y, SCREEN_HEIGHT - obj_radius))
-
-                if not self._check_overlap_at_pos(candidate_x, candidate_y, obj_radius, object_being_respawned):
-                    return candidate_x, candidate_y
-        
-        # Fallback: return preferred position even if it overlaps (should be rare)
-        # print(f"WARN: Could not find non-overlapping spawn for P{object_being_respawned.player_id}-Obj{object_being_respawned.object_id}, using preferred.")
-        return preferred_x, preferred_y
-
-
-    def _simulate_frame_physics_and_damage(self):
-        """
-        Simulates one frame of game physics: movement, boundary collisions,
-        object-object collisions, damage, scoring, and game over checks.
-        Returns True if any object was moving or a collision occurred.
-        # This is derived from main.py's Game.update() method's core logic.
-        # Also increments self.frame_count
-        """
-        if self.game_over:
-            return False
-        
-        self.frame_count +=1
-        any_object_activity_this_frame = False
-
-        # 1. Move all objects
-        for player_objs in self.players_objects:
-            for obj in player_objs:
-                if obj.is_moving:
-                    obj.move()
-                    obj.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
-                    if obj.is_moving: # Check again as move() might set it to False
-                        any_object_activity_this_frame = True
-        
-        # 2. Handle collisions and damage (Ported from main.py Game.update)
-        active_objects = [obj for player_list in self.players_objects for obj in player_list if obj.hp > 0]
-        for i in range(len(active_objects)):
-            for j in range(i + 1, len(active_objects)):
-                obj1 = active_objects[i]
-                obj2 = active_objects[j]
-
-                dist_x = obj1.x - obj2.x
-                dist_y = obj1.y - obj2.y
-                distance = math.hypot(dist_x, dist_y)
-
-                if distance == 0: # Avoid division by zero
-                    obj1.x += random.uniform(-0.1, 0.1)
-                    obj1.y += random.uniform(-0.1, 0.1)
-                    dist_x = obj1.x - obj2.x; dist_y = obj1.y - obj2.y
-                    distance = math.hypot(dist_x, dist_y)
-                    if distance == 0: continue
-
-                min_dist = obj1.radius + obj2.radius
-                if distance < min_dist:
-                    any_object_activity_this_frame = True # Collision occurred
-                    # Mark cross-team collision for shaping even if no damage is dealt
-                    if obj1.player_id != obj2.player_id:
-                        self.enemy_collision_happened_this_step = True
-                    # --- Overlap Resolution (from main.py) ---
-                    overlap = min_dist - distance
-                    nx = dist_x / distance if distance != 0 else 1.0
-                    ny = dist_y / distance if distance != 0 else 0.0
-
-                    inv_m1 = 1.0 / obj1.mass if obj1.mass > 0 else 0.0
-                    inv_m2 = 1.0 / obj2.mass if obj2.mass > 0 else 0.0
-                    total_inv_mass_correction = inv_m1 + inv_m2
-
-                    if total_inv_mass_correction > 0:
-                        correction_factor_obj1 = inv_m1 / total_inv_mass_correction
-                        correction_factor_obj2 = inv_m2 / total_inv_mass_correction
-                        obj1.x += nx * overlap * correction_factor_obj1
-                        obj1.y += ny * overlap * correction_factor_obj1
-                        obj2.x -= nx * overlap * correction_factor_obj2
-                        obj2.y -= ny * overlap * correction_factor_obj2
-                    elif obj1.mass > 0: obj1.x += nx * overlap; obj1.y += ny * overlap
-                    elif obj2.mass > 0: obj2.x -= nx * overlap; obj2.y -= ny * overlap
-                    
-                    # --- Impulse Calculation (from main.py) ---
-                    rvx = obj1.vx - obj2.vx
-                    rvy = obj1.vy - obj2.vy
-                    vel_along_normal = rvx * nx + rvy * ny
-
-                    if vel_along_normal < 0: # Objects are moving towards each other
-                        e = min(obj1.restitution, obj2.restitution)
-                        total_inv_mass_impulse = inv_m1 + inv_m2
-                        if total_inv_mass_impulse > 0:
-                            impulse_j = -(1 + e) * vel_along_normal / total_inv_mass_impulse
-                            obj1.vx += impulse_j * inv_m1 * nx
-                            obj1.vy += impulse_j * inv_m1 * ny
-                            obj2.vx -= impulse_j * inv_m2 * nx
-                            obj2.vy -= impulse_j * inv_m2 * ny
-
-                            if abs(obj1.vx) > 0.01 or abs(obj1.vy) > 0.01: obj1.is_moving = True
-                            if abs(obj2.vx) > 0.01 or abs(obj2.vy) > 0.01: obj2.is_moving = True
-
-                            # --- Damage Application (from main.py) ---
-                            if obj1.player_id != obj2.player_id:
-                                # Determine attacker (current player's object involved in collision)
-                                # and defender (opponent's object)
-                                # For RL, the "current_player_turn" is the one whose action initiated movement.
-                                # If obj1 or obj2 was the one launched by current_player_turn, or
-                                # became active due to that launch.
-                                # Simpler: if one is current_player_turn's team and other is not.
-                                # Let's assume damage is dealt by the object of the player whose turn it *was*
-                                # when the action was taken. This is stored in env.game.current_player_turn
-                                # (which is `current_player_id` in the step function before this simulation)
-                                # This part is tricky. main.py uses self.current_player_turn.
-                                # For the env, the "active" player for damage dealing should be the one
-                                # whose action is currently being processed.
-                                
-                                attacker_obj, defender_obj = None, None
-                                if obj1.player_id == self.current_player_turn and obj2.player_id != self.current_player_turn:
-                                    attacker_obj, defender_obj = obj1, obj2
-                                elif obj2.player_id == self.current_player_turn and obj1.player_id != self.current_player_turn:
-                                    attacker_obj, defender_obj = obj2, obj1
-
-                                if attacker_obj and defender_obj:
-                                    damaged = defender_obj.take_damage(attacker_obj.attack, self.frame_count)
-                                    if damaged and defender_obj.hp <= 0:
-                                        scoring_player_id = attacker_obj.player_id
-                                        self.scores[scoring_player_id] += 1
-                                        # print(f"DEBUG ENV: Player {scoring_player_id + 1} scores. Scores: {self.scores}")
-                                        if self.scores[scoring_player_id] >= MAX_VICTORY_POINTS:
-                                            self.game_over = True
-                                            self.winner = scoring_player_id
-                                            # print(f"DEBUG ENV: Player {self.winner + 1} wins!")
-                                            return False # Game ended, stop simulation
-
-                    obj1.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
-                    obj2.check_boundary_collision(SCREEN_WIDTH, SCREEN_HEIGHT)
-
-        # Removed old scoring logic based on team wipe. Scoring is per KO now.
-        # Game over is checked per KO.
-
-        if not any_object_activity_this_frame:
-            return False # All objects are stationary
-
-        return True # Objects were active or collision occurred
-
-    def _reset_round_for_scoring(self):
-        # This method is no longer used in the same way as main.py.
-        # main.py respawns all KO'd units at the end of an action sequence,
-        # and starts a new round if no player can move.
-        # Kept for now in case it's needed for a different game mode, but current logic won't call it.
-        pass
-
-    def draw_game_state(self, surface):
-        if self.headless_mode and surface is None: # Added check for surface is None for rgb_array case if game is headless
-            # If truly headless and no surface provided (e.g. for pure logic steps), do nothing.
-            # However, rgb_array mode in Env will provide a surface.
-            return
-
-        surface.fill(LIGHT_GREY)  # Background color
-
-        # Draw all game objects
-        for player_objs in self.players_objects:
-            for obj in player_objs:
-                # GameObject.draw handles its own drawing logic, including for KO'd objects
-                obj.draw(surface, self.font_small, self.font_hp_atk)
-
-        # Draw scores
-        score_text = f"P1 (Blue): {self.scores[0]}  |  P2 (Red): {self.scores[1]}"
-        score_surface = self.font.render(score_text, True, BLACK)
-        surface.blit(score_surface, (SCREEN_WIDTH // 2 - score_surface.get_width() // 2, 10))
-
-        # Draw current player turn
-        turn_text = f"Turn: Player {self.current_player_turn + 1}"
-        turn_color = BLUE if self.current_player_turn == 0 else RED
-        turn_surface = self.font.render(turn_text, True, turn_color)
-        surface.blit(turn_surface, (SCREEN_WIDTH // 2 - turn_surface.get_width() // 2, 40))
-        
-        # Draw "Can Move" indicator for current player
-        can_move = self.can_player_move(self.current_player_turn)
-        can_move_text = "Can Move" if can_move else "No Moves Left"
-        can_move_color = GREEN if can_move else GREY
-        can_move_surface = self.font.render(can_move_text, True, can_move_color)
-        surface.blit(can_move_surface, (SCREEN_WIDTH // 2 - can_move_surface.get_width() // 2, 70))
-
-
-        # Draw Game Over message if applicable
-        if self.game_over:
-            winner_text = ""
-            if self.winner is not None:
-                winner_text = f"Player {self.winner + 1} Wins!"
-            else: # Should not happen if game_over is True and MAX_VICTORY_POINTS logic is correct
-                winner_text = "Game Over - Draw?" 
-            
-            game_over_message = f"GAME OVER! {winner_text}"
-            game_over_surface = self.font.render(game_over_message, True, GREEN if self.winner is not None else BLACK)
-            text_rect = game_over_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
-            
-            # Simple background for game over text
-            bg_rect = text_rect.inflate(20, 20)
-            pygame.draw.rect(surface, LIGHT_GREY, bg_rect)
-            pygame.draw.rect(surface, BLACK, bg_rect, 2)
-            surface.blit(game_over_surface, text_rect)
+DAMAGE_TAKEN_COEFF = 0.5  # Semi-zero-sum coefficient (alpha) for damage_taken penalty
+# New constants for improved meaningless action handling
+MEANINGLESS_DAMAGE_THRESHOLD = 0.5  # effective minimal inflicted to count as meaningful
+MEANINGLESS_GRACE_STEPS = 2         # first K consecutive meaningless steps are free
+MEANINGLESS_BASE = 2.0              # starting penalty after grace
+MEANINGLESS_STEP = 0.5              # incremental increase per extra meaningless action
+MEANINGLESS_MAX = 6.0               # cap
 
 # --- SealSlammersEnv Class (Gym Environment) ---
 class SealSlammersEnv(gym.Env):
@@ -689,6 +209,9 @@ class SealSlammersEnv(gym.Env):
         
         self.consecutive_meaningless_actions = 0 # Reset counter
         self.last_opponent_action = [-1.0, -1.0, -1.0] # Reset opponent action
+        # New: per-player HP snapshots for delayed damage_taken (B2)
+        self._hp_snapshot_since_last_turn = {0: [obj.hp for obj in self.game.players_objects[0]],
+                                             1: [obj.hp for obj in self.game.players_objects[1]]}
 
         # --- Observation Construction ---
         observation = self._get_obs()
@@ -779,12 +302,10 @@ class SealSlammersEnv(gym.Env):
                           collision_happened: bool = False,
                           dist_before: float | None = None,
                           dist_after: float | None = None,
-                          alignment_score: float = 0.0):
-        # Core variables
+                          alignment_score: float = 0.0,
+                          carryover_damage_taken: float | None = None):
         opponent_player_id = 1 - current_player_id
-        score_diff_p_current = self.game.scores[current_player_id] - initial_scores[current_player_id]
-        initial_opponent_score = initial_scores[opponent_player_id]
-        current_opponent_score = self.game.scores[opponent_player_id]
+        delta_current = self.game.scores[current_player_id] - initial_scores[current_player_id]
         scale = getattr(self, 'shaping_scale', 1.0)
 
         # Initialize component values
@@ -802,45 +323,72 @@ class SealSlammersEnv(gym.Env):
         position_reward = 0.0
         time_penalty = 0.0
 
-        if score_diff_p_current > 0:
-            ko_points = score_diff_p_current * KO_POINT_REWARD
+        damage_inflicted = 0.0
+        damage_taken = 0.0
+        damage_net = 0.0
 
-        any_damage = False
-        total_damage = 0.0
+        if delta_current > 0:
+            ko_points = delta_current * KO_POINT_REWARD
+
         attacker_atk = selected_obj.attack if selected_obj else OBJECT_DEFAULT_ATTACK
+
+        # Compute inflicted / taken from snapshots
+        if initial_hp_states:
+            # Opponent damage inflicted
+            for idx, hp_before in enumerate(initial_hp_states[opponent_player_id]):
+                if idx < len(self.game.players_objects[opponent_player_id]):
+                    hp_after = self.game.players_objects[opponent_player_id][idx].hp
+                    d = hp_before - hp_after
+                    if d > 0:
+                        damage_inflicted += d
+            # immediate self-damage (can be rare); still computed but may be overridden
+            for idx, hp_before in enumerate(initial_hp_states[current_player_id]):
+                if idx < len(self.game.players_objects[current_player_id]):
+                    hp_after = self.game.players_objects[current_player_id][idx].hp
+                    d = hp_before - hp_after
+                    if d > 0:
+                        damage_taken += d
+        # Override with cross-turn carryover if provided
+        if carryover_damage_taken is not None:
+            damage_taken = carryover_damage_taken
+        damage_net = damage_inflicted - damage_taken
+        any_damage = (damage_inflicted > 1e-6 or damage_taken > 1e-6)
 
         if not selected_obj:
             invalid_penalty = INVALID_ACTION_PENALTY
         else:
             selection_reward = SELECTION_SHAPING_REWARD * scale
-            if initial_hp_states:
-                for idx, hp_before in enumerate(initial_hp_states[opponent_player_id]):
-                    if idx < len(self.game.players_objects[opponent_player_id]):
-                        hp_after = self.game.players_objects[opponent_player_id][idx].hp
-                        d = hp_before - hp_after
-                        if d > 0:
-                            total_damage += d
-                            any_damage = True
+
             if any_damage:
-                damage_base_reward = total_damage * DAMAGE_BASE_PER_HP
-                if attacker_atk > 0:
-                    if total_damage >= attacker_atk * 3:
-                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[3]
-                    elif total_damage >= attacker_atk * 2:
-                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[2]
-                    elif total_damage >= attacker_atk * 1:
-                        tier_bonus = total_damage * DAMAGE_TIER_MULTIPLIERS[1]
-            if score_diff_p_current == 0 and (current_opponent_score - initial_opponent_score) == 0 and not any_damage:
+                # Semi-zero-sum damage base
+                damage_base_reward = (damage_inflicted - DAMAGE_TAKEN_COEFF * damage_taken) * DAMAGE_BASE_PER_HP
+
+                # Tier bonus based ONLY on inflicted (offensive encouragement)
+                if damage_inflicted > 0 and attacker_atk > 0:
+                    if damage_inflicted >= attacker_atk * 3:
+                        tier_bonus = attacker_atk * 1.5 * scale
+                    elif damage_inflicted >= attacker_atk * 2:
+                        tier_bonus = attacker_atk * 1.0 * scale
+                    elif damage_inflicted >= attacker_atk * 1:
+                        tier_bonus = attacker_atk * 0.5 * scale
+
+            # Updated meaningless logic
+            if delta_current == 0 and damage_inflicted < MEANINGLESS_DAMAGE_THRESHOLD:
                 self.consecutive_meaningless_actions += 1
-                base_penalty = min(3.0 + (self.consecutive_meaningless_actions - 1) * 1.0, 10.0)
-                meaningless_penalty = base_penalty * scale
+                if self.consecutive_meaningless_actions > MEANINGLESS_GRACE_STEPS:
+                    steps_over = self.consecutive_meaningless_actions - MEANINGLESS_GRACE_STEPS - 1
+                    base_penalty = min(MEANINGLESS_BASE + steps_over * MEANINGLESS_STEP, MEANINGLESS_MAX)
+                    meaningless_penalty = base_penalty * scale
             else:
                 self.consecutive_meaningless_actions = 0
+
             if collision_happened and not any_damage:
                 collision_reward = COLLISION_SHAPING_REWARD * scale
+
             if dist_before is not None and dist_after is not None and dist_after < dist_before:
                 delta = dist_before - dist_after
                 dist_reward = min(delta / 80.0, DIST_REDUCTION_MAX_SHAPING) * scale
+
             if alignment_score > 0:
                 alignment_reward = min(alignment_score, 1.0) * ALIGNMENT_MAX_SHAPING * scale
 
@@ -851,7 +399,7 @@ class SealSlammersEnv(gym.Env):
             if self.game.winner == current_player_id:
                 win_bonus = WIN_REWARD
             elif self.game.winner == opponent_player_id:
-                loss_penalty = -abs(LOSS_PENALTY)  # ensure negative
+                loss_penalty = -abs(LOSS_PENALTY)
         else:
             time_penalty = TIME_STEP_PENALTY
 
@@ -865,6 +413,9 @@ class SealSlammersEnv(gym.Env):
             'loss_penalty': loss_penalty,
             'invalid_penalty': invalid_penalty,
             'selection_reward': selection_reward,
+            'damage_inflicted': damage_inflicted,
+            'damage_taken': damage_taken,
+            'damage_net': damage_net,
             'damage_base': damage_base_reward,
             'tier_bonus': tier_bonus,
             'meaningless_penalty': meaningless_penalty,
@@ -918,7 +469,6 @@ class SealSlammersEnv(gym.Env):
             # Find nearest opponent BEFORE applying force
             opponent_objs_alive = [o for o in self.game.players_objects[1 - current_player_id] if o.hp > 0]
             if opponent_objs_alive:
-                # Distance before
                 dists = [math.hypot(selected_obj.x - o.x, selected_obj.y - o.y) for o in opponent_objs_alive]
                 nearest_idx = int(np.argmin(dists))
                 dist_before = dists[nearest_idx]
@@ -991,7 +541,18 @@ class SealSlammersEnv(gym.Env):
 
         terminated = self.game.game_over
         
-        # NEW: compute post-simulation distance to nearest opponent for shaping
+        # Post-simulation HP snapshot BEFORE respawns (for delayed damage_taken)
+        post_hp_states = [[obj.hp for obj in p_objs] for p_objs in self.game.players_objects]
+        snapshot_prev = self._hp_snapshot_since_last_turn[current_player_id]
+        # Ensure length match
+        if snapshot_prev is None or len(snapshot_prev) != len(post_hp_states[current_player_id]):
+            snapshot_prev = post_hp_states[current_player_id]
+        carryover_damage_taken = 0.0
+        for prev, now in zip(snapshot_prev, post_hp_states[current_player_id]):
+            diff = prev - now
+            if diff > 0: carryover_damage_taken += diff
+
+        # Compute post distance
         dist_after = None
         if selected_obj:
             opponent_objs_alive_after = [o for o in self.game.players_objects[1 - current_player_id] if o.hp > 0]
@@ -1004,12 +565,16 @@ class SealSlammersEnv(gym.Env):
             initial_scores, initial_hp_states, selected_obj, terminated, current_player_id,
             collision_happened=self.game.enemy_collision_happened_this_step,
             dist_before=dist_before, dist_after=dist_after,
-            alignment_score=alignment_score
+            alignment_score=alignment_score,
+            carryover_damage_taken=carryover_damage_taken
         )
         
         # ADDED: Apply the specific, additional penalty if an already moved object was selected.
         if attempted_to_select_moved_object:
             reward -= 10.0  # 大幅减少惩罚，从250降到10
+
+        # Update snapshot for current player NOW (before respawns heal) for next turn damage_taken
+        self._hp_snapshot_since_last_turn[current_player_id] = post_hp_states[current_player_id]
 
         # Respawn KO\'d objects before turn progression (if game not over)
         if not terminated:
@@ -1154,11 +719,3 @@ class SealSlammersEnv(gym.Env):
         # Prevent double-closing logic on repeated calls
         self.render_mode = None
         return
-
-# Example of how to register (optional, can be done elsewhere)
-# from gymnasium.envs.registration import register
-# register(
-#     id='SealSlammers-v0',
-#     entry_point='__main__:SealSlammersEnv', # Or path to this file:module
-#     max_episode_steps=2000, # Max steps per episode if not handled by termination
-# )

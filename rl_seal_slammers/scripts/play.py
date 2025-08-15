@@ -520,10 +520,14 @@ if __name__ == "__main__":
     # play.py is in RL_Seal_Slammers/rl_seal_slammers/scripts/play.py
     # Project root is RL_Seal_Slammers/
     project_root_for_play_script = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    # Updated default model path to align with the new training script's output (MaskablePPO)
-    default_model_path = os.path.join(project_root_for_play_script, "models", "sb3_maskable_ppo_sealslammers_mlp", "maskable_ppo_sealslammers_mlp_model_final.zip")
-    parser.add_argument("--model-path", type=str, default=default_model_path,
-                        help=f"Path to the trained PPO model .zip file (default: {default_model_path}). Used if mode involves AI.")
+    models_base_dir = os.path.join(project_root_for_play_script, "models", "sb3_maskable_ppo_sealslammers_mlp")
+    # Model selection options compatible with new training layout
+    parser.add_argument("--model-env", type=str, default="base", choices=["base", "single_sided_greedy"],
+                        help="Environment name used during training (for locating models when model-path is not given).")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Run name folder to load model from; if not provided, the latest run under the env folder is used.")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Path to a trained PPO .zip model. If omitted, will try to pick from models/<env>/<run-name> or latest run.")
     
     args = parser.parse_args()
 
@@ -532,5 +536,36 @@ if __name__ == "__main__":
     if not pygame.font.get_init():
         pygame.font.init()
 
-    play_game(args.mode, args.objects, args.model_path,
+    # Resolve model path if not provided
+    model_path = args.model_path
+    if model_path is None:
+        # Prefer new layout: models/<env>/<run-name>/<prefix>_final.zip
+        env_dir = os.path.join(models_base_dir, args.model_env)
+        candidate = None
+        if args.run_name:
+            run_dir = os.path.join(env_dir, args.run_name)
+            candidate = os.path.join(run_dir, "maskable_ppo_sealslammers_mlp_model_final.zip")
+        else:
+            # pick latest run by mtime
+            try:
+                if os.path.isdir(env_dir):
+                    subdirs = [os.path.join(env_dir, d) for d in os.listdir(env_dir) if os.path.isdir(os.path.join(env_dir, d))]
+                    subdirs.sort(key=lambda d: os.path.getmtime(d), reverse=True)
+                    for d in subdirs:
+                        cand = os.path.join(d, "maskable_ppo_sealslammers_mlp_model_final.zip")
+                        if os.path.exists(cand):
+                            candidate = cand; break
+            except Exception:
+                candidate = None
+        if candidate and os.path.exists(candidate):
+            model_path = candidate
+        else:
+            # Fallback to old flat path
+            fallback = os.path.join(models_base_dir, "maskable_ppo_sealslammers_mlp_model_final.zip")
+            model_path = fallback if os.path.exists(fallback) else None
+
+    if model_path is None and ('ai' in args.mode):
+        print("[WARN] No model found automatically. You may pass --model-path explicitly.")
+
+    play_game(args.mode, args.objects, model_path,
               args.p0_hp, args.p0_atk, args.p1_hp, args.p1_atk) # Pass new args

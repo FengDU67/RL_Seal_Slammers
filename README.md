@@ -29,6 +29,10 @@
   - 继续训练 (resume)
   - 使用已有模型权重作为初始化重新训练 (init-from)
 - TensorBoard 记录：学习率、loss、策略熵、奖励组件等。
+- 对手与自博弈：
+  - Greedy 一步对手（单边训练用）
+  - MCTS 对手（可接入 PPO 策略先验与价值评估，含 progressive widening 与根噪声）
+  - 双边 MCTS 自我博弈环境，支持 z-only 终局奖励（AlphaZero 风格）
 
 ---
 ## 2. 环境与依赖安装
@@ -52,7 +56,12 @@ python -c "import torch;print(torch.cuda.is_available())"
 ```
 main.py                          # (可存在) 示例/调试纯游戏入口
 rl_seal_slammers/
-  envs/seal_slammers_env.py      # Gymnasium 自定义环境
+  envs/seal_slammers_env.py      # 基础环境（双边轮流，保持完整奖励）
+  envs/greedy_one_step.py        # 一步贪心对手
+  envs/mcts_agent.py             # MCTS 对手 + PPOPolicyAdapter
+  envs/seal_slammers_single_sided_greedy_env.py   # 单边训练：对手=Greedy
+  envs/seal_slammers_single_sided_mcts_env.py     # 单边训练：对手=MCTS（可接 PPO 先验/价值）
+  envs/seal_slammers_mcts_selfplay_env.py         # 双边 MCTS 自博弈（可选 z-only）
   physics_utils.py               # 共享物理/轨迹预测
   scripts/
     train.py                     # 训练入口 (MaskablePPO)
@@ -87,12 +96,32 @@ logs/                            # TensorBoard 日志 (含评估)
 ```bash
 python rl_seal_slammers/scripts/train.py \
   --target-total-timesteps 5000000 \
-  --lr-initial 3e-4 --lr-final 5e-5
+  --lr-initial 3e-4 --lr-final 5e-5 \
+  --env base \
+  --run-name 2025-08-15-exp1   # 可选，不写则自动用时间戳
+```
+
+单边 MCTS 对手：
+```bash
+python rl_seal_slammers/scripts/train.py \
+  --env single_sided_mcts \
+  --mcts-sims 128 --mcts-cpuct 1.4 --mcts-max-depth 3 \
+  --mcts-angle-step 6 --mcts-strength-topk 2 \
+  --run-name mcts-ss-128x
+```
+
+双边 MCTS 自博弈（AlphaZero 风格 z-only）：
+```bash
+python rl_seal_slammers/scripts/train.py \
+  --env mcts_selfplay --z-only \
+  --mcts-sims 160 --mcts-cpuct 1.25 --mcts-max-depth 3 \
+  --mcts-angle-step 6 --mcts-strength-topk 2 \
+  --run-name azero-sp-160x
 ```
 输出:
-- 模型: models/sb3_maskable_ppo_sealslammers_mlp/*_final.zip
-- 最优评估模型: models/.../_best/best_model.zip
-- 日志: logs/sb3_maskable_ppo_sealslammers_mlp
+- 日志: logs/sb3_maskable_ppo_sealslammers_mlp/<env>/<run-name>/
+- 模型: models/sb3_maskable_ppo_sealslammers_mlp/<env>/<run-name>/maskable_ppo_sealslammers_mlp_model_final.zip
+- 最优评估模型: models/.../<env>/<run-name>/maskable_ppo_sealslammers_mlp_model_best/best_model.zip
 
 ### 5.2 继续训练 (Resume)
 保持当前优化器状态 + timesteps 连续。
@@ -102,6 +131,10 @@ python rl_seal_slammers/scripts/train.py \
   --target-total-timesteps 8000000
 ```
 若已训练步数 >= 目标，会直接退出。
+
+保存策略：
+- 继续训练会在“运行专属目录”保存一份，同时覆盖 --resume-from 指定的原模型文件（你要求的“继续训练可以覆盖原来的模型”）。
+- fresh/init-from 则总是保存到新的 run 目录，不会覆盖旧模型（“不要覆盖原来的模型”）。
 
 ### 5.3 以已有模型作为初始化重新训练 (Init From)
 只加载网络权重，不加载 optimizer / timesteps；重新计数与调度。
@@ -115,10 +148,20 @@ python rl_seal_slammers/scripts/train.py \
 ### 5.4 参数说明
 | 参数 | 说明 |
 |------|------|
+| --env | 训练环境：`base` / `single_sided_greedy` / `single_sided_mcts` / `mcts_selfplay` |
+| --run-name | 运行目录名；fresh/init 未指定则用时间戳；resume 未指定则根据模型文件名推断 |
 | --resume-from | 继续训练文件路径 (.zip) |
 | --init-from | 作为初始化加载权重 |
 | --target-total-timesteps | 目标全局步数 (resume: 只训练剩余; fresh/init: 全量) |
 | --lr-initial / --lr-final | 线性学习率调度起止值 |
+| --z-only | 仅 mcts_selfplay 使用：对 PPO 暴露 ±1/0 终局奖励 |
+| --mcts-sims | MCTS 每步仿真次数（单边/自博弈） |
+| --mcts-cpuct | PUCT 探索常数 |
+| --mcts-max-depth | 搜索最大深度 |
+| --mcts-angle-step | 角度离散步长（例如 6 表示每 6° 取一个候选） |
+| --mcts-strength-topk | 每个对象考虑前 K 档力度 |
+
+提示：训练脚本会在 MCTS 环境中自动注入 PPOPolicyAdapter，使 MCTS 在扩展与价值回传时使用当前 PPO 的策略先验与价值评估。
 
 二者不可同时使用: resume 与 init-from 互斥。
 
@@ -148,6 +191,8 @@ tensorboard --logdir logs/sb3_maskable_ppo_sealslammers_mlp --port 6006
 TensorBoard 中记录: reward_components/<name>
 以及 reward_components/shaping_scale 追踪 shaping 衰减。
 
+注：在 `mcts_selfplay` 环境并开启 `--z-only` 时，PPO 接收到的是 z-only 奖励（±1/0），不再包含上述 shaping 组件；但游戏内部仍按完整规则判定胜负与物理结算。
+
 ---
 ## 7. 游玩 / 可视化 (Play)
 脚本: `rl_seal_slammers/scripts/play.py`
@@ -164,7 +209,9 @@ TensorBoard 中记录: reward_components/<name>
 |------|------|------|
 | `--mode` | 对战模式 | `--mode human_vs_ai` |
 | `--num-objects` | 每方棋子数量 (默认 3) | `--num-objects 4` |
-| `--model` | 加载已训练 PPO 模型 (MaskablePPO/PPO) | `--model models/.../best_model.zip` |
+| `--model-path` | 指定 PPO 模型路径 (MaskablePPO/PPO) | `--model-path models/.../best_model.zip` |
+| `--model-env` | 不给路径时，用此 env（base/single_sided_greedy/single_sided_mcts/mcts_selfplay）下最新 run 自动查找 | `--model-env base` |
+| `--run-name` | 配合 `--model-env` 指定具体 run 目录 | `--run-name 2025-08-15-exp1` |
 | `--p0-hp` / `--p1-hp` | 固定双方初始 HP (默认环境内部值) | `--p0-hp 45 --p1-hp 50` |
 | `--p0-atk` / `--p1-atk` | 固定双方初始 ATK | `--p0-atk 9 --p1-atk 8` |
 
@@ -172,11 +219,13 @@ TensorBoard 中记录: reward_components/<name>
 ```bash
 python rl_seal_slammers/scripts/play.py --mode human_vs_human
 ```
-玩家 vs 训练模型:
+玩家 vs 训练模型（自动从 base 环境下最新 run 取 final 模型）:
 ```bash
-python rl_seal_slammers/scripts/play.py \
-  --mode human_vs_ai \
-  --model models/sb3_maskable_ppo_sealslammers_mlp/maskable_ppo_sealslammers_mlp_model_final.zip
+python rl_seal_slammers/scripts/play.py --mode human_vs_ai --model-env base
+```
+指定具体 run：
+```bash
+python rl_seal_slammers/scripts/play.py --mode human_vs_ai --model-env base --run-name 2025-08-15-exp1
 ```
 模型 vs 玩家(玩家操作红方):
 ```bash
@@ -193,13 +242,21 @@ python rl_seal_slammers/scripts/play.py --mode ai_vs_ai_fast --model models/.../
 
 ---
 ## 8. 模型文件管理
-缺省保存位置:
+保存布局（新）：
 ```
 models/sb3_maskable_ppo_sealslammers_mlp/
-  maskable_ppo_sealslammers_mlp_model_final.zip   # 每轮训练完成后
-  maskable_ppo_sealslammers_mlp_model_best/       # EvalCallback 保存最佳模型目录
-    best_model.zip
+  <env>/
+    <run-name>/
+      maskable_ppo_sealslammers_mlp_model_final.zip
+      maskable_ppo_sealslammers_mlp_model_best/
+        best_model.zip
 ```
+日志布局：
+```
+logs/sb3_maskable_ppo_sealslammers_mlp/
+  <env>/<run-name>/
+```
+
 建议额外手动加：
 - 按时间戳归档 (避免覆盖)
 - 保存中间 checkpoint (可扩展自定义 Callback)
@@ -220,6 +277,9 @@ A: 使用 --target-total-timesteps 较小值(如 2e5) + 减少网络规模。
 
 Q: init-from 与 resume 区别？
 A: resume 继续优化器状态与时间步；init-from 仅迁移网络权重，学习率调度与计步从 0 重新开始。
+
+Q: 有多个环境 (base / single_sided_greedy) 时如何区分保存？
+A: 训练脚本会按 `models/.../<env>/<run-name>/` 和 `logs/.../<env>/<run-name>/` 分类保存。fresh/init-from 不覆盖旧模型；resume 会同时覆盖 `--resume-from` 指定文件。`--env` 现支持 `single_sided_mcts` 与 `mcts_selfplay`，可和 base/greedy 一起对比实验。
 
 ---
 ## 10. 贡献方式

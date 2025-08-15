@@ -6,7 +6,7 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.callbacks import CallbackList, BaseCallback
 from sb3_contrib.common.wrappers import ActionMasker
@@ -20,7 +20,13 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 # Now import the environment
-from rl_seal_slammers.envs.seal_slammers_env import SealSlammersEnv
+from rl_seal_slammers.envs import (
+    SealSlammersEnv,
+    SealSlammersSingleSidedGreedyEnv,
+    SealSlammersSingleSidedMCTSEnv,
+    SealSlammersMCTSSelfPlayEnv,
+    PPOPolicyAdapter,
+)
 
 # --- Helpers ---
 
@@ -95,52 +101,78 @@ def mask_fn(env):
 # --- Parameters ---
 NUM_OBJECTS_PER_PLAYER = 3
 TOTAL_TIMESTEPS = 5_000_000  # default target total timesteps (global)
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "sb3_maskable_ppo_sealslammers_mlp")
-MODEL_SAVE_DIR = os.path.join(PROJECT_ROOT, "models", "sb3_maskable_ppo_sealslammers_mlp")
+# Base folders; actual run paths will be resolved per env + run_name inside train_agent
+LOG_DIR_BASE = os.path.join(PROJECT_ROOT, "logs", "sb3_maskable_ppo_sealslammers_mlp")
+MODEL_DIR_BASE = os.path.join(PROJECT_ROOT, "models", "sb3_maskable_ppo_sealslammers_mlp")
 MODEL_NAME_PREFIX = "maskable_ppo_sealslammers_mlp_model"
 EVAL_FREQ = 80000
 N_EVAL_EPISODES = 15
-BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_best")
 N_ENVS = 12  # 从 8 提升到 12
 
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
-os.makedirs(BEST_MODEL_SAVE_PATH, exist_ok=True)
-
-def train_agent(resume_from=None, init_from=None, target_total_timesteps=TOTAL_TIMESTEPS, lr_initial=3e-4, lr_final=5e-5):
+def train_agent(resume_from=None, init_from=None, target_total_timesteps=TOTAL_TIMESTEPS, lr_initial=3e-4, lr_final=5e-5, env_name: str = "base", run_name: str | None = None, extra_env_kwargs: dict | None = None):
     if resume_from and init_from:
         print("Cannot use both --resume-from and --init-from simultaneously.")
         return
+    # Resolve env/run-specific directories
+    from datetime import datetime
+    if resume_from and not run_name:
+        # Derive run name from model file base when resuming
+        run_name = os.path.splitext(os.path.basename(resume_from))[0]
+    if (not resume_from) and (not run_name):
+        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    LOG_DIR = os.path.join(LOG_DIR_BASE, env_name, run_name)
+    MODEL_SAVE_DIR = os.path.join(MODEL_DIR_BASE, env_name, run_name)
+    BEST_MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_best")
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+    os.makedirs(BEST_MODEL_SAVE_PATH, exist_ok=True)
+
     print(f"Project Root: {PROJECT_ROOT}")
+    print(f"Env: {env_name} | Run: {run_name}")
     print(f"Log Directory: {LOG_DIR}")
     print(f"Model Directory: {MODEL_SAVE_DIR}")
 
     # Determine device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    
-    print("Initializing SealSlammersEnv for check...")
+
+    ENV_MAP = {
+        "base": SealSlammersEnv,
+        "single_sided_greedy": SealSlammersSingleSidedGreedyEnv,
+        "single_sided_mcts": SealSlammersSingleSidedMCTSEnv,
+        "mcts_selfplay": SealSlammersMCTSSelfPlayEnv,
+    }
+    if env_name not in ENV_MAP:
+        raise ValueError(f"Unknown env '{env_name}'. Supported: {list(ENV_MAP.keys())}")
+    EnvClass = ENV_MAP[env_name]
+
+    print(f"Initializing env '{env_name}' for check...")
     # render_mode=None is default, suitable for headless check
-    single_env_instance = SealSlammersEnv(num_objects_per_player=NUM_OBJECTS_PER_PLAYER)
+    _extra = extra_env_kwargs or {}
+    single_env_instance = EnvClass(num_objects_per_player=NUM_OBJECTS_PER_PLAYER, **_extra)
     print("Checking environment compatibility with SB3...")
     check_env(single_env_instance, warn=True, skip_render_check=True)
     print("Environment check passed.")
     single_env_instance.close()
 
-    print(f"Creating vectorized environment with n_envs={N_ENVS}...")
+    # Use single-process vec env for MCTS modes so adapters can be injected safely
+    is_mcts_mode = env_name in ("single_sided_mcts", "mcts_selfplay")
+    n_envs = 1 if is_mcts_mode else N_ENVS
+    print(f"Creating vectorized environment with n_envs={n_envs} (is_mcts_mode={is_mcts_mode})...")
     env_kwargs = {'num_objects_per_player': NUM_OBJECTS_PER_PLAYER}
+    if extra_env_kwargs:
+        env_kwargs.update(extra_env_kwargs)
     # Wrap training envs: ActionMasker -> TimeLimit -> Monitor
-    env_fns = [
-        lambda: Monitor(
-            TimeLimit(
-                ActionMasker(SealSlammersEnv(render_mode=None, **env_kwargs), mask_fn),
-                max_episode_steps=300
-            )
-        )
-        for _ in range(N_ENVS)
-    ]
-    env = SubprocVecEnv(env_fns)
-    print(f"Using {N_ENVS} parallel environments.")
+    def make_wrapped_env():
+        e = EnvClass(render_mode=None, **env_kwargs)
+        # If env supports policy adapter and we're in an MCTS mode, set it after model is created (see below)
+        return Monitor(TimeLimit(ActionMasker(e, mask_fn), max_episode_steps=300))
+
+    env_fns = [make_wrapped_env for _ in range(n_envs)]
+    env = (DummyVecEnv(env_fns) if is_mcts_mode else SubprocVecEnv(env_fns))
+    print(f"Using {n_envs} parallel environments.")
 
     def create_fresh_model():
         return MaskablePPO(
@@ -214,22 +246,18 @@ def train_agent(resume_from=None, init_from=None, target_total_timesteps=TOTAL_T
 
     # --- Callbacks ---
     print("Creating evaluation environment...")
-    eval_env_fns = [
-        lambda: Monitor(
-            TimeLimit(
-                ActionMasker(SealSlammersEnv(num_objects_per_player=NUM_OBJECTS_PER_PLAYER, render_mode=None), mask_fn),
-                max_episode_steps=300
-            )
-        )
-    ]
-    eval_env = SubprocVecEnv(eval_env_fns)  # Use SubprocVecEnv for eval_env as well
+    def make_eval_env():
+        ee = EnvClass(num_objects_per_player=NUM_OBJECTS_PER_PLAYER, render_mode=None, **(extra_env_kwargs or {}))
+        return Monitor(TimeLimit(ActionMasker(ee, mask_fn), max_episode_steps=300))
+    eval_env_fns = [make_eval_env]
+    eval_env = (DummyVecEnv(eval_env_fns) if is_mcts_mode else SubprocVecEnv(eval_env_fns))
     print(f"Evaluation environment type: {type(eval_env)}")
 
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=BEST_MODEL_SAVE_PATH,
         log_path=LOG_DIR,
-        eval_freq=max(EVAL_FREQ // N_ENVS, 1),
+    eval_freq=max(EVAL_FREQ // n_envs, 1),
         n_eval_episodes=N_EVAL_EPISODES,
         deterministic=False,
         render=False
@@ -268,7 +296,42 @@ def train_agent(resume_from=None, init_from=None, target_total_timesteps=TOTAL_T
             return True
 
     reward_comp_logger_cb = RewardComponentTensorboardCallback()
-    callbacks = CallbackList([eval_callback, entropy_cb, shaping_cb, reward_comp_logger_cb])
+
+    # Optional: during learning, keep MCTS policy adapters pointing to current PPO policy
+    class AdapterSyncCallback(BaseCallback):
+        def _on_step(self) -> bool:
+            # No-op step hook; required by BaseCallback
+            return True
+        def _on_training_start(self) -> None:
+            try:
+                if any(k in env_name for k in ("single_sided_mcts", "mcts_selfplay")):
+                    adapter = PPOPolicyAdapter(self.model)
+                    # Vector env: set adapter on each sub-env if supported
+                    if hasattr(self.training_env, 'envs'):
+                        for sub in self.training_env.envs:
+                            base = getattr(sub, 'env', sub)
+                            if hasattr(base, 'set_policy_adapter'):
+                                base.set_policy_adapter(adapter)
+                            if hasattr(base, 'set_policy_adapters'):
+                                base.set_policy_adapters(adapter, adapter)
+                    # Also set on eval env
+                    if hasattr(eval_env, 'envs'):
+                        for sub in eval_env.envs:
+                            base = getattr(sub, 'env', sub)
+                            if hasattr(base, 'set_policy_adapter'):
+                                base.set_policy_adapter(adapter)
+                            if hasattr(base, 'set_policy_adapters'):
+                                base.set_policy_adapters(adapter, adapter)
+            except Exception as e:
+                print(f"AdapterSyncCallback warning: {e}")
+            return True
+
+        def _on_rollout_end(self) -> bool:
+            # Refresh adapter reference after each batch of updates (model parameters changed)
+            return self._on_training_start()
+
+    adapter_sync_cb = AdapterSyncCallback()
+    callbacks = CallbackList([eval_callback, entropy_cb, shaping_cb, reward_comp_logger_cb, adapter_sync_cb])
 
     # Determine learn params
     if resume_from:
@@ -291,11 +354,24 @@ def train_agent(resume_from=None, init_from=None, target_total_timesteps=TOTAL_T
         print(f"Training error: {e}")
         import traceback; traceback.print_exc()
     finally:
-        # --- Save Final Model ---
+        # --- Save Final Model(s) ---
+        # Always save into run-specific folder to avoid overwriting in fresh/init runs
         final_model_path = os.path.join(MODEL_SAVE_DIR, f"{MODEL_NAME_PREFIX}_final.zip")
-        model.save(final_model_path)
-        print(f"Final model saved to {final_model_path}")
-        print(f"Best model saved to {BEST_MODEL_SAVE_PATH}")
+        try:
+            model.save(final_model_path)
+            print(f"Final model saved to {final_model_path}")
+        except Exception as se:
+            print(f"Warning: could not save final model to run folder: {se}")
+
+        # If resuming, also overwrite the original model file as requested
+        if resume_from:
+            try:
+                model.save(resume_from)
+                print(f"Resumed model overwritten at {resume_from}")
+            except Exception as se:
+                print(f"Warning: could not overwrite resume model: {se}")
+
+        print(f"Best model directory: {BEST_MODEL_SAVE_PATH}")
         print(f"Tensorboard logs available at: {LOG_DIR}")
         # Close eval env (important to terminate subprocesses)
         try:
@@ -322,9 +398,37 @@ if __name__ == "__main__":
     parser.add_argument('--target-total-timesteps', type=int, default=TOTAL_TIMESTEPS, help='Final global timesteps to reach (resume) or total to run (fresh/init)')
     parser.add_argument('--lr-initial', type=float, default=3e-4, help='Initial LR for schedule')
     parser.add_argument('--lr-final', type=float, default=5e-5, help='Final LR for schedule')
+    # Training environment selection
+    parser.add_argument('--run-name', type=str, default=None, help='Run name for saving logs/models; default is timestamp (fresh/init) or derived from resume file (resume)')
+    parser.add_argument('--env', type=str, default='base', choices=['base', 'single_sided_greedy', 'single_sided_mcts', 'mcts_selfplay'], help='Which environment to use for training and eval')
+    # Optional z-only reward for self-play envs
+    parser.add_argument('--z-only', action='store_true', help='If set with mcts_selfplay, expose terminal +/-1/0 reward to PPO')
+    # MCTS hyperparameters (used by single_sided_mcts and mcts_selfplay)
+    parser.add_argument('--mcts-sims', type=int, default=128, help='Number of simulations per move for MCTS')
+    parser.add_argument('--mcts-cpuct', type=float, default=1.4, help='PUCT exploration constant')
+    parser.add_argument('--mcts-max-depth', type=int, default=3, help='Max search depth')
+    parser.add_argument('--mcts-angle-step', type=int, default=6, help='Angle discretization step (e.g., 6 -> 60,66,72...)')
+    parser.add_argument('--mcts-strength-topk', type=int, default=2, help='Consider top-K strengths per object during expansion')
     args = parser.parse_args()
+    # Build extra kwargs for envs (MCTS hyperparams and z-only flag)
+    extra = {}
+    if args.env in ('single_sided_mcts', 'mcts_selfplay'):
+        extra.update({
+            'mcts_sims': args.mcts_sims,
+            'mcts_cpuct': args.mcts_cpuct,
+            'mcts_max_depth': args.mcts_max_depth,
+            'mcts_angle_step': args.mcts_angle_step,
+            'mcts_strength_topk': args.mcts_strength_topk,
+        })
+    if args.env == 'mcts_selfplay':
+        extra['z_only_reward'] = bool(args.z_only)
+
+    # Call training
     train_agent(resume_from=args.resume_from,
                 init_from=args.init_from,
                 target_total_timesteps=args.target_total_timesteps,
                 lr_initial=args.lr_initial,
-                lr_final=args.lr_final)
+                lr_final=args.lr_final,
+                env_name=args.env,
+                run_name=args.run_name,
+                extra_env_kwargs=extra)
